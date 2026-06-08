@@ -178,7 +178,7 @@ def calculate_scores(today_list, m1_list, m3_list, deposit_annual):
     return results
 
 
-def analyze_detail(fund_code, deposit_rate):
+def analyze_detail(fund_code, deposit_rate, ref_date=None):
     history = tefas_fetch_fund_history(fund_code, days_back=95)
     if len(history) < 5:
         return None
@@ -189,8 +189,12 @@ def analyze_detail(fund_code, deposit_rate):
 
     total_ret = (prices[-1] / prices[0]) - 1
 
-    # Takvim günü bazlı hesaplama (ana sayfa ile tutarlı)
-    last_date = datetime.strptime(dates[-1], "%Y-%m-%d")
+    # Referans tarih: ana sayfadakiyle aynı olmalı
+    if ref_date:
+        last_date = datetime.strptime(ref_date, "%Y-%m-%d")
+    else:
+        last_date = datetime.strptime(dates[-1], "%Y-%m-%d")
+
     target_30 = (last_date - timedelta(days=30)).strftime("%Y-%m-%d")
     target_60 = (last_date - timedelta(days=60)).strftime("%Y-%m-%d")
 
@@ -203,10 +207,12 @@ def analyze_detail(fund_code, deposit_rate):
                 best_idx, best_diff = i, diff
         return prices[best_idx] if best_idx is not None else prices[0]
 
+    # Mevcut fiyatı da referans tarihinden al
+    p_now = nearest_price(last_date.strftime("%Y-%m-%d"))
     p30 = nearest_price(target_30)
     p60 = nearest_price(target_60)
-    ret30 = (prices[-1] / p30) - 1
-    ret60 = (prices[-1] / p60) - 1
+    ret30 = (p_now / p30) - 1
+    ret60 = (p_now / p60) - 1
     vol = float(np.std(daily_ret) * np.sqrt(252))
     cummax = np.maximum.accumulate(prices)
     maxdd = float(np.max((cummax - prices) / cummax))
@@ -395,8 +401,8 @@ RESULTS_PAGE = HTML_TEMPLATE.replace(r"{% block content %}{% endblock %}", r"""
 
 <div class="stitle"><span style="font-size:1.6rem">⭐</span> Önerilen Fonlar (Önümüzdeki Ay)</div>
 <div class="rec-grid">
-{% for f in recommended %}
-<a href="/fund/{{ f.code }}?rate={{ rate }}" class="fc" style="text-decoration:none;color:inherit">
+        {% for f in recommended %}
+<a href="/fund/{{ f.code }}?rate={{ rate }}&date={{ date }}" class="fc" style="text-decoration:none;color:inherit">
 <div class="rank">{{ loop.index }}</div>
 <div class="fh">
 <span class="fcode">{{ f.code }}</span>
@@ -458,7 +464,7 @@ function renderTable(funds) {
     tb.innerHTML = '';
     funds.forEach((f,i) => {
         const sc = f.score>=70?'color:#00d68f':f.score>=50?'color:#4f8cff':f.score>=30?'color:#ffa502':'color:#ff4757';
-        tb.innerHTML += `<tr onclick="location.href='/fund/${f.code}?rate={{ rate }}'">
+        tb.innerHTML += `<tr onclick="location.href='/fund/${f.code}?rate={{ rate }}&date={{ date }}'">
             <td>${i+1}</td>
             <td><strong style="color:var(--accl)">${f.code}</strong></td>
             <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${f.name}</td>
@@ -677,7 +683,8 @@ def results_page():
 @app.route("/fund/<code>")
 def fund_detail_page(code):
     rate = float(request.args.get("rate", 40))
-    detail = analyze_detail(code.upper(), rate / 100)
+    ref_date = request.args.get("date", None)
+    detail = analyze_detail(code.upper(), rate / 100, ref_date=ref_date)
 
     if not detail:
         return render_template_string(HTML_TEMPLATE.replace(
