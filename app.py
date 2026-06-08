@@ -61,20 +61,28 @@ def tefas_fetch_day(target_date: str, kind: str = "YAT"):
     return data.get("resultList") or []
 
 
-def tefas_fetch_fund_history(fund_code: str, days_back: int = 95, kind: str = "YAT"):
+def tefas_fetch_fund_history(fund_code: str, days_back: int = 120, kind: str = "YAT"):
     end_dt = datetime.now()
     start_dt = end_dt - timedelta(days=days_back)
     all_rows = []
+    seen = set()
     cur = start_dt
     while cur <= end_dt:
         chunk_end = min(cur + timedelta(days=27), end_dt)
         body = api_body(cur.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d"), kind, fund_code.upper())
-        try:
-            resp = requests.post(INFO_URL, json=body, headers=API_HEADERS, timeout=30)
-            rows = resp.json().get("resultList") or []
-            all_rows.extend([{"date": r.get("tarih"), "price": r.get("fiyat")} for r in rows])
-        except Exception:
-            pass
+        for attempt in range(3):
+            try:
+                import time; time.sleep(1)
+                resp = requests.post(INFO_URL, json=body, headers=API_HEADERS, timeout=30)
+                rows = resp.json().get("resultList") or []
+                for r in rows:
+                    key = r.get("tarih")
+                    if key and key not in seen:
+                        seen.add(key)
+                        all_rows.append({"date": key, "price": r.get("fiyat")})
+                break
+            except Exception:
+                import time; time.sleep(2)
         cur = chunk_end + timedelta(days=1)
     return all_rows
 
@@ -194,46 +202,57 @@ def calculate_scores(today_list, m1_list, m3_list, deposit_annual):
 
 
 def analyze_detail(fund_code, deposit_rate, ref_date=None):
-    history = tefas_fetch_fund_history(fund_code, days_back=95)
+    """Detay sayfası analizi — TEFAS ile aynı metrikler."""
+    # Ana sayfayla aynı tarih referansını kullan
+    if ref_date:
+        ref_dt = datetime.strptime(ref_date, "%Y-%m-%d")
+    else:
+        ref_dt = datetime.now()
+
+    # Yeterli geçmiş veri çek (3 ay = ~120 gün)
+    history = tefas_fetch_fund_history(fund_code, days_back=120)
     if len(history) < 5:
         return None
 
+    # Tarihleri sırala (eski → yeni)
+    history.sort(key=lambda h: h["date"])
     prices = [h["price"] for h in history]
     dates = [h["date"] for h in history]
-    daily_ret = np.diff(prices) / prices[:-1]
 
-    total_ret = (prices[-1] / prices[0]) - 1
-
-    # Referans tarih: ana sayfadakiyle aynı olmalı
-    if ref_date:
-        last_date = datetime.strptime(ref_date, "%Y-%m-%d")
-    else:
-        last_date = datetime.strptime(dates[-1], "%Y-%m-%d")
-
-    target_30 = subtract_months(last_date, 1).strftime("%Y-%m-%d")
-    target_60 = subtract_months(last_date, 3).strftime("%Y-%m-%d")
-
-    # En yakın tarihi bul
-    def nearest_price(target_dt):
-        best_idx, best_diff = None, 999
+    # ── Güncel fiyat: Referans tarihine en yakın fiyat ──
+    def nearest_idx(target_str):
+        target = datetime.strptime(target_str, "%Y-%m-%d")
+        best_i, best_d = 0, 999
         for i, d in enumerate(dates):
-            diff = abs((datetime.strptime(d, "%Y-%m-%d") - datetime.strptime(target_dt, "%Y-%m-%d")).days)
-            if diff < best_diff:
-                best_idx, best_diff = i, diff
-        return prices[best_idx] if best_idx is not None else prices[0]
+            diff = abs((datetime.strptime(d, "%Y-%m-%d") - target).days)
+            if diff < best_d:
+                best_i, best_d = i, diff
+        return best_i
 
-    # Mevcut fiyatı da referans tarihinden al
-    p_now = nearest_price(last_date.strftime("%Y-%m-%d"))
-    p30 = nearest_price(target_30)
-    p60 = nearest_price(target_60)
-    ret30 = (p_now / p30) - 1
-    ret60 = (p_now / p60) - 1
+    cur_idx = nearest_idx(ref_dt.strftime("%Y-%m-%d"))
+    cur_price = prices[cur_idx]
+    cur_date = dates[cur_idx]
+
+    # ── 1 Ay ve 3 Ay getirileri (takvim ayı, ana sayfayla aynı) ──
+    target_1m = subtract_months(ref_dt, 1)
+    target_3m = subtract_months(ref_dt, 3)
+
+    p_1m = prices[nearest_idx(target_1m.strftime("%Y-%m-%d"))]
+    p_3m = prices[nearest_idx(target_3m.strftime("%Y-%m-%d"))]
+
+    ret_1m = (cur_price / p_1m) - 1 if p_1m > 0 else 0
+    ret_3m = (cur_price / p_3m) - 1 if p_3m > 0 else 0
+
+    # Yıllıklaştırılmış getiri (3 aylık üzerinden)
+    ann_ret = ((1 + ret_3m) ** 4 - 1) if ret_3m > -1 else 0
+
+    # ── Teknik analiz ──
+    daily_ret = np.diff(prices) / prices[:-1]
     vol = float(np.std(daily_ret) * np.sqrt(252))
     cummax = np.maximum.accumulate(prices)
     maxdd = float(np.max((cummax - prices) / cummax))
     avg_dr = float(np.mean(daily_ret))
-    ann_ret = (1 + avg_dr) ** 252 - 1
-    sharpe = float((ann_ret - deposit_rate) / vol) if vol > 0 else 0
+    sharpe = float((avg_dr * 252 - deposit_rate) / vol) if vol > 0 else 0
 
     if len(prices) >= 10:
         x = np.arange(10)
@@ -249,12 +268,14 @@ def analyze_detail(fund_code, deposit_rate, ref_date=None):
 
     return {
         "code": fund_code, "prices": prices[-30:], "dates": dates[-30:],
-        "total_ret": round(total_ret * 100, 2), "ret30": round(ret30 * 100, 2),
-        "ret60": round(ret60 * 100, 2), "ann_ret": round(ann_ret * 100, 1),
+        "cur_price": round(cur_price, 6), "cur_date": cur_date,
+        "ret_1m": round(ret_1m * 100, 2),
+        "ret_3m": round(ret_3m * 100, 2),
+        "ann_ret": round(ann_ret * 100, 1),
         "vol": round(vol * 100, 2), "maxdd": round(maxdd * 100, 2),
         "sharpe": round(sharpe, 2), "tdir": tdir, "tstr": round(tstr, 4),
         "ma_sig": ma_sig, "ma10": round(ma10, 6), "ma20": round(ma20, 6),
-        "cur_price": round(prices[-1], 6), "npoints": len(prices),
+        "npoints": len(prices),
     }
 
 
@@ -512,11 +533,10 @@ DETAIL_PAGE = HTML_TEMPLATE.replace(r"{% block content %}{% endblock %}", r"""
 <h2 style="color:var(--accl);margin:20px 0">{{ d.code }} Detaylı Analiz</h2>
 
 <div class="det-grid">
-<div class="det-item"><div class="dl">Güncel Fiyat</div><div class="dv">{{ d.cur_price }}</div></div>
-<div class="det-item"><div class="dl">Son 30 Gün</div><div class="dv" style="color:{{ '#00d68f' if d.ret30>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ret30) }}%</div></div>
-<div class="det-item"><div class="dl">Son 60 Gün</div><div class="dv" style="color:{{ '#00d68f' if d.ret60>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ret60) }}%</div></div>
-<div class="det-item"><div class="dl">Toplam Dönem</div><div class="dv" style="color:{{ '#00d68f' if d.total_ret>0 else '#ff4757' }}">{{ "%+.2f"|format(d.total_ret) }}%</div></div>
-<div class="det-item"><div class="dl">3 Aylık Toplam</div><div class="dv" style="color:{{ '#00d68f' if d.ann_ret>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ann_ret) }}%</div></div>
+<div class="det-item"><div class="dl">Güncel Fiyat ({{ d.cur_date }})</div><div class="dv">{{ d.cur_price }}</div></div>
+<div class="det-item"><div class="dl">1 Aylık Getiri (%)</div><div class="dv" style="color:{{ '#00d68f' if d.ret_1m>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ret_1m) }}%</div></div>
+<div class="det-item"><div class="dl">3 Aylık Getiri (%)</div><div class="dv" style="color:{{ '#00d68f' if d.ret_3m>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ret_3m) }}%</div></div>
+<div class="det-item"><div class="dl">Yıllıklaştırılmış (%)</div><div class="dv" style="color:{{ '#00d68f' if d.ann_ret>0 else '#ff4757' }}">{{ "%+.1f"|format(d.ann_ret) }}%</div></div>
 <div class="det-item"><div class="dl">Volatilite (Yıllık)</div><div class="dv">{{ d.vol }}%</div></div>
 <div class="det-item"><div class="dl">Max Drawdown</div><div class="dv" style="color:#ff4757">-{{ d.maxdd }}%</div></div>
 <div class="det-item"><div class="dl">Sharpe Oranı</div><div class="dv" style="color:{{ '#00d68f' if d.sharpe>1 else ('#4f8cff' if d.sharpe>0 else '#ff4757') }}">{{ d.sharpe }}</div></div>
@@ -527,7 +547,7 @@ DETAIL_PAGE = HTML_TEMPLATE.replace(r"{% block content %}{% endblock %}", r"""
 </div>
 
 <div class="chart-box">
-<h3>📈 Son 30 Gün Fiyat Grafiği</h3>
+<h3>📈 Son 30 İş Günü Fiyat Grafiği</h3>
 <canvas id="chart" width="800" height="250" style="width:100%;max-height:250px"></canvas>
 </div>
 
