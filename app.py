@@ -5,6 +5,7 @@ PythonAnywhere veya bilgisayarda çalıştırılabilir
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
+import calendar
 
 import numpy as np
 import requests
@@ -15,6 +16,20 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── TEFAS API ──────────────────────────────────────────────────────────────────
+
+def subtract_months(dt, months):
+    """Takvim ayı geriye alır (TEFAS ile aynı hesaplama).
+    Örnek: 5 Haziran - 1 ay = 5 Mayıs (timedelta(days=30)=6 Mayıs DEĞİL)
+    """
+    month = dt.month - months
+    year = dt.year
+    while month <= 0:
+        month += 12
+        year -= 1
+    max_day = calendar.monthrange(year, month)[1]
+    day = min(dt.day, max_day)
+    return dt.replace(year=year, month=month, day=day)
+
 
 INFO_URL = "https://www.tefas.gov.tr/api/funds/fonGnlBlgSiraliGetir"
 
@@ -101,7 +116,7 @@ def calculate_scores(today_list, m1_list, m3_list, deposit_annual):
 
         ret_1m = (price_now / price_m1) - 1
         ret_3m = (price_now / price_m3) - 1
-        ann_ret = (1 + ret_3m) ** 4 - 1
+        ann_ret = ret_3m  # Ana sayfada "3 Ay" göster, yıllıklaştırma yapma
 
         # 1) MOMENTUM (30)
         mom = 0
@@ -195,8 +210,8 @@ def analyze_detail(fund_code, deposit_rate, ref_date=None):
     else:
         last_date = datetime.strptime(dates[-1], "%Y-%m-%d")
 
-    target_30 = (last_date - timedelta(days=30)).strftime("%Y-%m-%d")
-    target_60 = (last_date - timedelta(days=60)).strftime("%Y-%m-%d")
+    target_30 = subtract_months(last_date, 1).strftime("%Y-%m-%d")
+    target_60 = subtract_months(last_date, 3).strftime("%Y-%m-%d")
 
     # En yakın tarihi bul
     def nearest_price(target_dt):
@@ -413,7 +428,7 @@ RESULTS_PAGE = HTML_TEMPLATE.replace(r"{% block content %}{% endblock %}", r"""
 <div class="met"><div class="ml">Fiyat</div><div class="mv">{{ "%.4f"|format(f.price) }}</div></div>
 <div class="met"><div class="ml">1 Ay</div><div class="mv {{ 'pos' if f.r1m > 0 else 'neg' }}">{{ "%+.2f"|format(f.r1m) }}%</div></div>
 <div class="met"><div class="ml">3 Ay</div><div class="mv {{ 'pos' if f.r3m > 0 else 'neg' }}">{{ "%+.2f"|format(f.r3m) }}%</div></div>
-<div class="met"><div class="ml">Yıllıklaştırılmış</div><div class="mv {{ 'pos' if f.ann > 0 else 'neg' }}">{{ "%+.1f"|format(f.ann) }}%</div></div>
+<div class="met"><div class="ml">6 Aylık</div><div class="mv {{ 'pos' if f.ann > 0 else 'neg' }}\">{{ "%+.2f"|format(f.ann) }}%</div></div>
 <div class="met"><div class="ml">Portföy (₺)</div><div class="mv" style="font-size:.85rem">{{ fmt_size(f.size) }}</div></div>
 <div class="met"><div class="ml">Yatırımcı</div><div class="mv">{{ fmt_num(f.investors) }}</div></div>
 </div>
@@ -448,7 +463,7 @@ Geçmiş performans gelecekteki getirilerin garantisi değildir. Yatırım karar
 </div>
 <div style="overflow-x:auto">
 <table>
-<thead><tr><th>#</th><th>Kod</th><th>Fon Adı</th><th>Fiyat</th><th>1A %</th><th>3A %</th><th>Yıllık %</th><th>Skor</th><th>Tahmin</th><th>Risk</th></tr></thead>
+<thead><tr><th>#</th><th>Kod</th><th>Fon Adı</th><th>Fiyat</th><th>1A %</th><th>3A %</th><th>Skor</th><th>Tahmin</th><th>Risk</th></tr></thead>
 <tbody id="tbody"></tbody>
 </table>
 </div>
@@ -471,7 +486,6 @@ function renderTable(funds) {
             <td>${f.price.toFixed(4)}</td>
             <td style="color:${f.r1m>0?'var(--grn)':'var(--red)'};font-weight:600">${f.r1m>0?'+':''}${f.r1m}%</td>
             <td style="color:${f.r3m>0?'var(--grn)':'var(--red)'};font-weight:600">${f.r3m>0?'+':''}${f.r3m}%</td>
-            <td style="color:${f.ann>0?'var(--grn)':'var(--red)'}">${f.ann>0?'+':''}${f.ann}%</td>
             <td style="${sc};font-weight:700">${f.score}</td>
             <td>${f.pred}</td>
             <td>${f.risk_label}</td>
@@ -502,7 +516,7 @@ DETAIL_PAGE = HTML_TEMPLATE.replace(r"{% block content %}{% endblock %}", r"""
 <div class="det-item"><div class="dl">Son 30 Gün</div><div class="dv" style="color:{{ '#00d68f' if d.ret30>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ret30) }}%</div></div>
 <div class="det-item"><div class="dl">Son 60 Gün</div><div class="dv" style="color:{{ '#00d68f' if d.ret60>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ret60) }}%</div></div>
 <div class="det-item"><div class="dl">Toplam Dönem</div><div class="dv" style="color:{{ '#00d68f' if d.total_ret>0 else '#ff4757' }}">{{ "%+.2f"|format(d.total_ret) }}%</div></div>
-<div class="det-item"><div class="dl">Yıllıklaştırılmış</div><div class="dv" style="color:{{ '#00d68f' if d.ann_ret>0 else '#ff4757' }}">{{ "%+.1f"|format(d.ann_ret) }}%</div></div>
+<div class="det-item"><div class="dl">3 Aylık Toplam</div><div class="dv" style="color:{{ '#00d68f' if d.ann_ret>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ann_ret) }}%</div></div>
 <div class="det-item"><div class="dl">Volatilite (Yıllık)</div><div class="dv">{{ d.vol }}%</div></div>
 <div class="det-item"><div class="dl">Max Drawdown</div><div class="dv" style="color:#ff4757">-{{ d.maxdd }}%</div></div>
 <div class="det-item"><div class="dl">Sharpe Oranı</div><div class="dv" style="color:{{ '#00d68f' if d.sharpe>1 else ('#4f8cff' if d.sharpe>0 else '#ff4757') }}">{{ d.sharpe }}</div></div>
@@ -613,17 +627,20 @@ def analyze():
         actual_date_fmt = today_list[0].get("tarih", actual_date)
         logger.info(f"Bugün: {actual_date_fmt}, {len(today_list)} fon")
 
-        # 1 ay önce (TEFAS ile aynı: tam 30 gün)
+        # 1 ay önce (takvim ayı - TEFAS ile aynı)
         logger.info("1 ay önce çekiliyor...")
-        m1_base = (datetime.strptime(actual_date_fmt, "%Y-%m-%d") - timedelta(days=30)).strftime("%Y%m%d")
+        actual_dt = datetime.strptime(actual_date_fmt, "%Y-%m-%d")
+        m1_date = subtract_months(actual_dt, 1)
+        m1_base = m1_date.strftime("%Y%m%d")
         _, m1_list = find_nearest_day(m1_base, offset_range=range(0, 5))
-        logger.info(f"1a: {len(m1_list)} fon")
+        logger.info(f"1a: {len(m1_list)} fon (hedef: {m1_base})")
 
-        # 3 ay önce (TEFAS ile aynı: tam 90 gün)
+        # 3 ay önce (takvim ayı - TEFAS ile aynı)
         logger.info("3 ay önce çekiliyor...")
-        m3_base = (datetime.strptime(actual_date_fmt, "%Y-%m-%d") - timedelta(days=90)).strftime("%Y%m%d")
+        m3_date = subtract_months(actual_dt, 3)
+        m3_base = m3_date.strftime("%Y%m%d")
         _, m3_list = find_nearest_day(m3_base, offset_range=range(0, 5))
-        logger.info(f"3a: {len(m3_list)} fon")
+        logger.info(f"3a: {len(m3_list)} fon (hedef: {m3_base})")
 
         # Skorları hesapla
         scores = calculate_scores(today_list, m1_list, m3_list, dep_net)
