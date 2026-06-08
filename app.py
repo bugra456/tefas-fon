@@ -188,8 +188,25 @@ def analyze_detail(fund_code, deposit_rate):
     daily_ret = np.diff(prices) / prices[:-1]
 
     total_ret = (prices[-1] / prices[0]) - 1
-    ret30 = (prices[-1] / prices[-min(30, len(prices))]) - 1
-    ret60 = (prices[-1] / prices[-min(60, len(prices))]) - 1 if len(prices) > 60 else total_ret
+
+    # Takvim günü bazlı hesaplama (ana sayfa ile tutarlı)
+    last_date = datetime.strptime(dates[-1], "%Y-%m-%d")
+    target_30 = (last_date - timedelta(days=30)).strftime("%Y-%m-%d")
+    target_60 = (last_date - timedelta(days=60)).strftime("%Y-%m-%d")
+
+    # En yakın tarihi bul
+    def nearest_price(target_dt):
+        best_idx, best_diff = None, 999
+        for i, d in enumerate(dates):
+            diff = abs((datetime.strptime(d, "%Y-%m-%d") - datetime.strptime(target_dt, "%Y-%m-%d")).days)
+            if diff < best_diff:
+                best_idx, best_diff = i, diff
+        return prices[best_idx] if best_idx is not None else prices[0]
+
+    p30 = nearest_price(target_30)
+    p60 = nearest_price(target_60)
+    ret30 = (prices[-1] / p30) - 1
+    ret60 = (prices[-1] / p60) - 1
     vol = float(np.std(daily_ret) * np.sqrt(252))
     cummax = np.maximum.accumulate(prices)
     maxdd = float(np.max((cummax - prices) / cummax))
