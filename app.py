@@ -590,16 +590,16 @@ def analyze():
         actual_date_fmt = today_list[0].get("tarih", actual_date)
         logger.info(f"Bugün: {actual_date_fmt}, {len(today_list)} fon")
 
-        # 1 ay önce
+        # 1 ay önce (TEFAS ile aynı: tam 30 gün)
         logger.info("1 ay önce çekiliyor...")
-        m1_base = (datetime.strptime(actual_date_fmt, "%Y-%m-%d") - timedelta(days=32)).strftime("%Y%m%d")
-        _, m1_list = find_nearest_day(m1_base)
+        m1_base = (datetime.strptime(actual_date_fmt, "%Y-%m-%d") - timedelta(days=30)).strftime("%Y%m%d")
+        _, m1_list = find_nearest_day(m1_base, offset_range=range(0, 5))
         logger.info(f"1a: {len(m1_list)} fon")
 
-        # 3 ay önce
+        # 3 ay önce (TEFAS ile aynı: tam 90 gün)
         logger.info("3 ay önce çekiliyor...")
-        m3_base = (datetime.strptime(actual_date_fmt, "%Y-%m-%d") - timedelta(days=95)).strftime("%Y%m%d")
-        _, m3_list = find_nearest_day(m3_base)
+        m3_base = (datetime.strptime(actual_date_fmt, "%Y-%m-%d") - timedelta(days=90)).strftime("%Y%m%d")
+        _, m3_list = find_nearest_day(m3_base, offset_range=range(0, 5))
         logger.info(f"3a: {len(m3_list)} fon")
 
         # Skorları hesapla
