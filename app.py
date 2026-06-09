@@ -202,6 +202,47 @@ MIN_SPREAD = {
 
 RISK_MULT = {1: 1.0, 2: 0.9, 3: 0.8, 4: 0.65, 5: 0.5, 6: 0.35, 7: 0.2}
 
+# ═══════════════════════════════════════════════════════════════
+# TEMEL ANALİZ — Faiz beklentisi bazlı puanlama
+# ═══════════════════════════════════════════════════════════════
+
+# Senaryo: {risk seviyesi: puan bonus/penalty}
+OUTLOOK_BONUS = {
+    "fall": {   # Faiz düşecek → tahvil fiyatları artar → borçlanma fonları lehte
+        1: -5, 2: 15, 3: 12, 4: 5, 5: 0, 6: -3, 7: -5,
+    },
+    "stable": {  # Faiz sabit → nötr
+        1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0,
+    },
+    "rise": {   # Faiz yükselecek → tahvil fiyatları düşer → borçlanma aleyhte
+        1: 10, 2: -15, 3: -12, 4: -5, 5: 0, 6: 5, 7: 3,
+    },
+}
+
+OUTLOOK_GUIDE = {
+    "fall": {
+        "title": "📉 Temel Analiz: Faiz Düşüş Ortamı",
+        "summary": "TCMB kademeli faiz indirimi yapıyor. Bu ortamda tahvil fiyatları yükselir.",
+        "fav": "Risk 2-3 (Borçlanma, Tahvil) fonlar",
+        "avoid": "Risk 1 (Para Piyasası) — mevduat faizi de düşecek, avantaj azalır",
+        "logic": "Faizler düşünce eski tahviller (yüksek kuponlu) değer kazanır. Borçlanma fonlarının portföyündeki tahviller değerlenecek.",
+    },
+    "stable": {
+        "title": "➡️ Temel Analiz: Nötr Ortam",
+        "summary": "TCMB faizleri sabit tutuyor. Temel analizin ek etkisi sınırlı.",
+        "fav": "Tutarlı performans gösteren fonlar (teknik analiz ağırlıklı)",
+        "avoid": "—",
+        "logic": "Faiz değişmediği için tahvil fiyatlarında büyük hareket beklenmez. Geçmiş tutarlılık daha önemli.",
+    },
+    "rise": {
+        "title": "📈 Temel Analiz: Faiz Yükseliş Ortamı",
+        "summary": "TCMB faiz artırıyor. Bu ortamda tahvil fiyatları düşer.",
+        "fav": "Risk 1 (Para Piyasası) — kısa vadeli, faiz artışından korunaklı",
+        "avoid": "Risk 2-3 (Borçlanma) — tahvil fiyatları düşebilir, zarar riski var",
+        "logic": "Faizler yükselince piyasada yeni tahviller daha yüksek kuponlu çıkar, eski tahviller değer kaybeder. Uzun vadeli borçlanma fonları olumsuz etkilenir.",
+    },
+}
+
 
 # ═══════════════════════════════════════════════════════════════
 # SKORLAMA VE FİLTRELEME
@@ -518,11 +559,53 @@ HOME_PAGE = HTML_BASE.replace(r"{% block content %}{% endblock %}", r"""
 <p style="color:var(--txt2);font-size:.8rem;margin-top:12px">
 Stopaj (%15) otomatik düşülür → Net aylık mevduat getirisi hesaplanır.<br>
 <strong>Örnek:</strong> %40 brüt → %34 net yıllık → <strong>aylık %2.83 net</strong> mevduat getirisi.
-<br><br>
-💡 <strong>Nasıl çalışır?</strong> Mevduatınızı sadece %0.01 geçen fonları değil,
-risk seviyesine göre anlamlı fark koyan fonları gösterir.
 </p>
 </div>
+
+<div class="inp-sec" style="margin-top:10px">
+<h2>📉 TCMB Faiz Beklentiniz (Temel Analiz)</h2>
+<p style="color:var(--txt2);font-size:.85rem;margin-bottom:15px">
+Merkez Bankası'nın önümüzdeki dönemde ne yapacağını düşünüyorsunuz?<br>
+<strong>Neden önemli?</strong> Faizler düşünce tahvil fiyatları yükselir → Borçlanma fonları kazanır.
+Faizler yükselince tam tersi.
+</p>
+<form action="/analyze" method="POST" class="inp-g" style="flex-direction:column;gap:12px"
+      onsubmit="showLoad('Analiz yapılıyor...')">
+<div style="display:flex;flex-wrap:wrap;gap:10px;justify-content:center">
+<input type="radio" name="outlook" value="fall" id="o_fall" style="display:none">
+<label for="o_fall" class="outlook-btn" onclick="selectOutlook(this,'fall')" style="cursor:pointer;background:var(--bg);border:2px solid var(--brd);border-radius:12px;padding:14px 20px;text-align:center;transition:.3s;min-width:200px;display:block">
+<div style="font-size:1.5rem">📉</div>
+<div style="font-weight:700;color:var(--grn)">Faiz Düşecek</div>
+<div style="font-size:.75rem;color:var(--txt2);margin-top:4px">Kademeli faiz indirimi<br><strong style="color:var(--grn)">→ Tahvil fonları lehte</strong></div>
+</label>
+<input type="radio" name="outlook" value="stable" id="o_stable" style="display:none" checked>
+<label for="o_stable" class="outlook-btn" onclick="selectOutlook(this,'stable')" style="cursor:pointer;background:var(--bg);border:2px solid var(--acc);border-radius:12px;padding:14px 20px;text-align:center;transition:.3s;min-width:200px;display:block">
+<div style="font-size:1.5rem">➡️</div>
+<div style="font-weight:700;color:var(--acc)">Faiz Sabit Kalacak</div>
+<div style="font-size:.75rem;color:var(--txt2);margin-top:4px">Faiz değişikliği beklenmiyor<br><strong style="color:var(--acc)">→ Nötr ortam</strong></div>
+</label>
+<input type="radio" name="outlook" value="rise" id="o_rise" style="display:none">
+<label for="o_rise" class="outlook-btn" onclick="selectOutlook(this,'rise')" style="cursor:pointer;background:var(--bg);border:2px solid var(--brd);border-radius:12px;padding:14px 20px;text-align:center;transition:.3s;min-width:200px;display:block">
+<div style="font-size:1.5rem">📈</div>
+<div style="font-weight:700;color:var(--red)">Faiz Yükselecek</div>
+<div style="font-size:.75rem;color:var(--txt2);margin-top:4px">Faiz artışı bekleniyor<br><strong style="color:var(--red)">→ Tahvil fonları aleyhte</strong></div>
+</label>
+</div>
+<input type="number" name="rate" id="hidden_rate" value="40" style="display:none">
+<button type="submit" class="btn" style="margin-top:8px">🔍 Temel Analiz ile Tara</button>
+</form>
+</div>
+
+<script>
+function selectOutlook(el, val) {
+    document.querySelectorAll('.outlook-btn').forEach(b => b.style.borderColor = 'var(--brd)');
+    el.style.borderColor = 'var(--acc)';
+}
+// Üst formdaki rate değerini alt formdaki gizli inputa da kopyala
+document.querySelector('input[name="rate"]')?.addEventListener('input', function() {
+    document.getElementById('hidden_rate').value = this.value;
+});
+</script>
 {% endblock %}
 """)
 
@@ -542,6 +625,20 @@ RESULTS_PAGE = HTML_BASE.replace(r"{% block content %}{% endblock %}", r"""
 
 <div class="info-box">
 <h3>📌 Öneri Kriterleri — Risk seviyesine göre minimum fark</h3>
+
+{% if outlook != 'stable' %}
+<div style="background:rgba(79,140,255,.08);border:1px solid rgba(79,140,255,.3);border-radius:10px;padding:15px;margin-bottom:15px">
+<h4 style="color:var(--acc);margin-bottom:8px">{{ guide.title }}</h4>
+<p style="color:var(--txt);font-size:.9rem;margin-bottom:8px">{{ guide.summary }}</p>
+<table style="margin:8px 0">
+<tr><td style="color:var(--grn);font-weight:600">✓ Lehte</td><td>{{ guide.fav }}</td></tr>
+<tr><td style="color:var(--red);font-weight:600">✗ Dikkat</td><td>{{ guide.avoid }}</td></tr>
+</table>
+<p style="color:var(--txt2);font-size:.8rem;border-top:1px solid var(--brd);padding-top:8px">
+💡 <strong>Mantık:</strong> {{ guide.logic }}
+</p>
+</div>
+{% endif %}
 <p>Mevduatınız aylık <strong>{{ dep_m }}%</strong> getiriyor. Bir fonun önerilebilmesi için
 beklenen aylık getirisi şu minimumları geçmelidir:</p>
 <table>
@@ -764,6 +861,9 @@ def home():
 @app.route("/analyze", methods=["POST"])
 def analyze():
     rate = float(request.form.get("rate", 40))
+    outlook = request.form.get("outlook", "stable")  # fall / stable / rise
+    if outlook not in ("fall", "stable", "rise"):
+        outlook = "stable"
     if rate <= 0 or rate > 200:
         return "Geçersiz faiz oranı", 400
 
@@ -841,6 +941,18 @@ def analyze():
         above = [s for s in scores if s["spread_pct"] > 0]
         dep_pct = round(dep_monthly * 100, 2)
 
+        # ── TEMEL ANALİZ BONUSU ──
+        # Faiz beklentisine göre skor bonus/penalty uygula
+        outlook_bonuses = OUTLOOK_BONUS.get(outlook, {})
+        guide = OUTLOOK_GUIDE.get(outlook, OUTLOOK_GUIDE["stable"])
+        for s in scores:
+            bonus = outlook_bonuses.get(s["risk"], 0)
+            s["outlook_bonus"] = bonus
+            s["score_with_outlook"] = round(max(0, min(100, s["score"] + bonus)), 1)
+        # Yeniden sırala (outlook dahil)
+        scores.sort(key=lambda x: x["score_with_outlook"], reverse=True)
+        recommended = [s for s in scores if s["passes"] and s["risk"] >= 2][:20]
+
         return render_template_string(RESULTS_PAGE,
             date=actual_date_fmt,
             dep_m=dep_pct,
@@ -855,6 +967,8 @@ def analyze():
             min_r2=round((dep_monthly + 0.007) * 100, 2),
             min_r4=round((dep_monthly + 0.010) * 100, 2),
             min_r6=round((dep_monthly + 0.020) * 100, 2),
+            outlook=outlook,
+            guide=guide,
         )
 
     except Exception as e:
