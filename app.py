@@ -1,6 +1,6 @@
 """
-TEFAS Fon Tavsiye Sistemi - Tek Dosya Versiyonu
-Render.com üzerinde çalışır
+TEFAS Fon Tavsiye Sistemi
+Hedef: Mevduat faizini güvenle geçebilecek fonları bulmak
 """
 import logging
 from datetime import datetime, timedelta
@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 # ── TEFAS API ──────────────────────────────────────────────────────────────────
 
 def subtract_months(dt, months):
-    """Takvim ayı geriye alır (TEFAS ile aynı hesaplama)."""
     month = dt.month - months
     year = dt.year
     while month <= 0:
@@ -52,7 +51,6 @@ def api_body(bas_tarih, bit_tarih, fon_tipi="YAT", fon_kodu=None):
 
 
 def tefas_fetch_day(target_date: str, kind: str = "YAT"):
-    """Tek bir tarihin TEFAS verisini çeker."""
     for attempt in range(3):
         try:
             if attempt > 0:
@@ -67,35 +65,7 @@ def tefas_fetch_day(target_date: str, kind: str = "YAT"):
                 return []
 
 
-def tefas_fetch_fund_history(fund_code: str, days_back: int = 200, kind: str = "YAT"):
-    """Tek bir fonun geçmiş fiyatlarını çeker (6 ay ~ 200 gün)."""
-    end_dt = datetime.now()
-    start_dt = end_dt - timedelta(days=days_back)
-    all_rows = []
-    seen = set()
-    cur = start_dt
-    while cur <= end_dt:
-        chunk_end = min(cur + timedelta(days=27), end_dt)
-        body = api_body(cur.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d"), kind, fund_code.upper())
-        for attempt in range(3):
-            try:
-                time.sleep(1)
-                resp = requests.post(INFO_URL, json=body, headers=API_HEADERS, timeout=30)
-                rows = resp.json().get("resultList") or []
-                for r in rows:
-                    key = r.get("tarih")
-                    if key and key not in seen:
-                        seen.add(key)
-                        all_rows.append({"date": key, "price": r.get("fiyat")})
-                break
-            except Exception:
-                time.sleep(2)
-        cur = chunk_end + timedelta(days=1)
-    return all_rows
-
-
 def find_nearest_day(base_date_str, offset_range=range(0, 7)):
-    """Verilen tarihte veri yoksa yakın günleri dener."""
     for offset in offset_range:
         d = datetime.strptime(base_date_str, "%Y%m%d") + timedelta(days=offset)
         result = tefas_fetch_day(d.strftime("%Y%m%d"))
@@ -104,11 +74,61 @@ def find_nearest_day(base_date_str, offset_range=range(0, 7)):
     return None, []
 
 
-# ── SKORLAMA ───────────────────────────────────────────────────────────────────
+# ── RİSK SEVİYESİ (TEFAS ile aynı) ────────────────────────────────────────────
+
+def get_risk_level(fund_name):
+    """Fon adından TEFAS risk seviyesini hesaplar (1-7).
+    1 = En düşük risk (Para Piyasası)
+    7 = En yüksek risk (Serbest)
+    """
+    n = fund_name.upper()
+    if "PARA PİYASASI" in n or "PARA PIYASASI" in n:
+        return 1
+    if "BORÇLANMA" in n or "BORCLANMA" in n or "TAHVİL" in n or "TAHVIL" in n:
+        return 2
+    if "KAMU" in n and ("BORÇ" in n or "TAHVİL" in n):
+        return 2
+    if "ALTIN" in n:
+        return 4
+    if "GÜMÜŞ" in n or "GUMUS" in n:
+        return 4
+    if "DÖVİZ" in n or "DOVIZ" in n or "DOLAR" in n or "EURO" in n:
+        return 4
+    if "KARMA" in n:
+        return 4
+    if "EMTİA" in n or "EMTIA" in n:
+        return 5
+    if "DEĞİŞKEN" in n or "DEGISKEN" in n:
+        return 5
+    if "HİSSE" in n or "HISSE" in n:
+        return 6
+    if "SERBEST" in n:
+        return 7
+    return 5  # Bilinmeyen = orta-yüksek
+
+
+RISK_LABELS = {
+    1: ("1/7 - Çok Düşük", "#00d68f"),
+    2: ("2/7 - Düşük", "#4f8cff"),
+    3: ("3/7 - Orta Düşük", "#4f8cff"),
+    4: ("4/7 - Orta", "#ffa502"),
+    5: ("5/7 - Orta Yüksek", "#ffa502"),
+    6: ("6/7 - Yüksek", "#ff4757"),
+    7: ("7/7 - Çok Yüksek", "#ff4757"),
+}
+
+
+# ── SKORLAMA: Mevduatı Geçme Analizi ──────────────────────────────────────────
 
 def calculate_scores(today_list, m1_list, m3_list, m6_list, deposit_annual):
-    """Fonları puanlar. m1/m3/m6_list: 1/3/6 ay önceki veri listeleri."""
-    deposit_m = deposit_annual / 12
+    """
+    Her fon için: mevduatı geçme olasılığı + güvenilirlik puanı.
+    
+    Puan ne anlama gelir:
+    - Yüksek puan = Mevduatı geçme olasılığı yüksek VE riski düşük
+    - Düşük puan = Ya riski yüksek, ya da geçmişte mevduatı geçememiş
+    """
+    deposit_m = deposit_annual / 12  # Aylık net mevduat getirisi
     results = []
 
     m1_map = {r["fonKodu"]: r for r in m1_list}
@@ -122,12 +142,12 @@ def calculate_scores(today_list, m1_list, m3_list, m6_list, deposit_annual):
         size = row.get("portfoyBuyukluk", 0) or 0
         inv_now = row.get("kisiSayisi", 0) or 0
 
-        # ── İşlem görmeyen fonları filtrele ──
+        # Filtre: işlem görmeyen fonları ele
         if price_now <= 0:
             continue
-        if (row.get("tedPaySayisi") or 0) <= 0:   # Pay adedi yok = işlem görmüyor
+        if (row.get("tedPaySayisi") or 0) <= 0:
             continue
-        if inv_now < 200:     # 200'den az yatırımcı = dar kapsamlı/özel fon (ABG gibi)
+        if inv_now < 200:
             continue
 
         m1 = m1_map.get(code)
@@ -136,7 +156,6 @@ def calculate_scores(today_list, m1_list, m3_list, m6_list, deposit_annual):
         price_m1 = m1["fiyat"] if m1 else None
         price_m3 = m3["fiyat"] if m3 else None
         price_m6 = m6["fiyat"] if m6 else None
-        inv_m1 = m1.get("kisiSayisi", 0) if m1 else None
 
         if not price_m1 or price_m1 <= 0 or not price_m3 or price_m3 <= 0:
             continue
@@ -145,168 +164,102 @@ def calculate_scores(today_list, m1_list, m3_list, m6_list, deposit_annual):
         ret_3m = (price_now / price_m3) - 1
         ret_6m = (price_now / price_m6) - 1 if price_m6 and price_m6 > 0 else None
 
-        # 1) MOMENTUM (30)
-        mom = 0
-        if ret_1m > deposit_m * 2: mom += 15
-        elif ret_1m > deposit_m: mom += 12
-        elif ret_1m > 0: mom += 6
-        if ret_3m > deposit_m * 6: mom += 15
-        elif ret_3m > deposit_m * 3: mom += 12
-        elif ret_3m > 0: mom += 6
+        # TEFAS risk seviyesi
+        risk = get_risk_level(name)
+        risk_label, risk_color = RISK_LABELS.get(risk, ("?/7", "#fff"))
 
-        # 2) RİSK-GETİRİ (25)
-        risk = 0
-        m_3m_avg = ret_3m / 3
-        consistency = 1 - abs(ret_1m - m_3m_avg) / max(abs(m_3m_avg), 0.001)
-        excess = ret_1m - deposit_m
-        rp = excess / max(consistency, 0.01)
-        if rp > deposit_m: risk += 25
-        elif rp > 0: risk += 18
-        elif excess > 0: risk += 10
+        # ── MEVDUATI GEÇME KONTROLÜ ──
+        beat_1m = ret_1m > deposit_m  # Son 1 ayda mevduatı geçti mi?
+        beat_3m_avg = (ret_3m / 3) > deposit_m  # Son 3 ay ortalamada geçti mi?
+        beat_6m_avg = (ret_6m / 6 > deposit_m) if ret_6m is not None else False
 
-        # 3) İSTİKRAR (20)
-        stab = 0
-        pos = sum(1 for r in [ret_1m, ret_3m / 3] if r > 0)
-        if pos == 2: stab += 10
-        abv = sum(1 for r in [ret_1m, ret_3m / 3] if r > deposit_m)
-        if abv == 2: stab += 10
-        elif abv == 1: stab += 5
-        if size > 1e9: stab += 5
-        elif size > 1e8: stab += 3
-        stab = min(stab, 20)
+        beats_count = sum([beat_1m, beat_3m_avg, beat_6m_avg])
 
-        # 4) TREND (15)
-        trend = 0
-        acc = ret_1m - m_3m_avg
-        if acc > deposit_m: trend += 10
-        elif acc > 0: trend += 7
-        elif acc > -deposit_m: trend += 3
-        if ret_1m > 0.03: trend += 5
-        elif ret_1m > 0.01: trend += 3
-        trend = min(trend, 15)
+        # ── PUAN HESABI ──
+        # 1) Mevduatı Geçme Sıklığı (35 puan) - 3 dönemden kaçında geçti?
+        if beats_count == 3:
+            beat_score = 35
+        elif beats_count == 2:
+            beat_score = 25
+        elif beats_count == 1:
+            beat_score = 12
+        else:
+            beat_score = 0
 
-        # 5) YATIRIMCI (10)
-        inv_s = 0.0
-        if inv_m1 and inv_m1 > 0:
-            chg = (inv_now - inv_m1) / inv_m1
-            if chg > 0.05: inv_s += 7
-            elif chg > 0: inv_s += 4
-            elif chg > -0.02: inv_s += 2
-        if inv_now > 1000: inv_s += 3
-        elif inv_now > 100: inv_s += 1
-        inv_s = min(inv_s, 10)
+        # 2) Risk Seviyesi (25 puan) - Düşük risk = öngörülebilir = güvenli
+        risk_score = max(0, 25 - (risk - 1) * 4)  # Risk 1→25, 7→1
 
-        total = mom + risk + stab + trend + inv_s
+        # 3) Getiri İstikrarı (20 puan) - 1 aylık ile 3 aylık ort. arası fark küçük mü?
+        if ret_3m > 0:
+            avg_3m = ret_3m / 3
+            stability = 1 - min(abs(ret_1m - avg_3m) / max(abs(avg_3m), 0.001), 1)
+            stab_score = round(stability * 20)
+        else:
+            stab_score = 0
 
-        if total >= 70: rl, pred, picon = "Düşük Risk", "📈 Yükseliş", "up"
-        elif total >= 50: rl, pred, picon = "Orta Risk", "➡️ Yatay/Yükseliş", "neutral"
-        elif total >= 30: rl, pred, picon = "Yüksek Risk", "⚠️ Belirsiz", "neutral"
-        else: rl, pred, picon = "Çok Yüksek Risk", "📉 Düşüş Riski", "down"
+        # 4) Fon Büyüklüğü (10 puan) - Büyük fon = daha güvenli, daha likit
+        if size > 5e9:
+            size_score = 10
+        elif size > 1e9:
+            size_score = 8
+        elif size > 100e6:
+            size_score = 5
+        else:
+            size_score = 2
+
+        # 5) Yatırımcı Güveni (10 puan) - Çok yatırımcı = güvenilir
+        if inv_now > 50000:
+            inv_score = 10
+        elif inv_now > 10000:
+            inv_score = 7
+        elif inv_now > 1000:
+            inv_score = 4
+        else:
+            inv_score = 1
+
+        total = beat_score + risk_score + stab_score + size_score + inv_score
+
+        # Mevduatı geçme olasılığı tahmini
+        if beats_count == 3 and risk <= 2:
+            probability = "Çok Yüksek (%85+)"
+        elif beats_count >= 2 and risk <= 3:
+            probability = "Yüksek (%70-85)"
+        elif beats_count >= 2:
+            probability = "Orta (%50-70)"
+        elif beats_count == 1 and risk <= 3:
+            probability = "Orta (%50-65)"
+        elif beats_count == 1:
+            probability = "Düşük (%30-50)"
+        else:
+            probability = "Çok Düşük (%15-30)"
+
+        # Beklenen aylık getiri tahmini (konservatif)
+        if ret_6m is not None:
+            expected_monthly = (ret_6m / 6) * 0.7  # %30 güvenlik indirimi
+        elif ret_3m > 0:
+            expected_monthly = (ret_3m / 3) * 0.6
+        else:
+            expected_monthly = ret_1m * 0.4
 
         results.append({
             "code": code, "name": name, "price": price_now,
             "size": size, "investors": inv_now,
+            "risk": risk, "risk_label": risk_label, "risk_color": risk_color,
             "r1m": round(ret_1m * 100, 2),
             "r3m": round(ret_3m * 100, 2),
             "r6m": round(ret_6m * 100, 2) if ret_6m is not None else None,
-            "beats": ret_1m > deposit_m,
+            "beat_1m": beat_1m, "beat_3m": beat_3m_avg, "beat_6m": beat_6m_avg,
+            "beats": beat_1m,
             "score": round(total, 1),
-            "s_mom": round(mom, 1), "s_risk": round(risk, 1),
-            "s_stab": round(stab, 1), "s_trend": round(trend, 1),
-            "s_inv": round(inv_s, 1),
-            "risk_label": rl, "pred": pred, "picon": picon,
+            "s_beat": beat_score, "s_risk": risk_score,
+            "s_stab": stab_score, "s_size": size_score, "s_inv": inv_score,
+            "probability": probability,
+            "expected_monthly": round(expected_monthly * 100, 2),
+            "deposit_monthly": round(deposit_m * 100, 2),
         })
 
     results.sort(key=lambda x: x["score"], reverse=True)
     return results
-
-
-def fetch_fund_price(fund_code, target_date_str):
-    """Belirli bir tarihte belirli bir fonun fiyatını çeker. Bulamazsa yakın günleri dener."""
-    fund_code = fund_code.upper()
-    for offset in range(0, 7):
-        d = datetime.strptime(target_date_str, "%Y%m%d") - timedelta(days=offset)
-        result = tefas_fetch_day(d.strftime("%Y%m%d"))
-        for r in result:
-            if r.get("fonKodu") == fund_code:
-                p = r.get("fiyat", 0)
-                if p and p > 0:
-                    return float(p), r.get("tarih", d.strftime("%Y-%m-%d"))
-    return None, None
-
-
-def analyze_detail(fund_code, deposit_rate, ref_date=None):
-    """Detay sayfası — getiri hesaplamaları ana sayfayla AYNI kaynakta."""
-    if ref_date:
-        ref_dt = datetime.strptime(ref_date, "%Y-%m-%d")
-    else:
-        ref_dt = datetime.now()
-
-    ref_str = ref_dt.strftime("%Y%m%d")
-
-    # ── Getiriler: Ana sayfayla AYNI yöntem — tam tarihleri çek ──
-    cur_price, cur_date = fetch_fund_price(fund_code, ref_str)
-    if not cur_price:
-        return None
-
-    p_1m, _ = fetch_fund_price(fund_code, subtract_months(ref_dt, 1).strftime("%Y%m%d"))
-    p_3m, _ = fetch_fund_price(fund_code, subtract_months(ref_dt, 3).strftime("%Y%m%d"))
-    p_6m, _ = fetch_fund_price(fund_code, subtract_months(ref_dt, 6).strftime("%Y%m%d"))
-
-    ret_1m = (cur_price / p_1m) - 1 if p_1m and p_1m > 0 else None
-    ret_3m = (cur_price / p_3m) - 1 if p_3m and p_3m > 0 else None
-    ret_6m = (cur_price / p_6m) - 1 if p_6m and p_6m > 0 else None
-
-    # ── Grafik + teknik analiz: sadece son 45 gün yeterli ──
-    history = tefas_fetch_fund_history(fund_code, days_back=45)
-    if len(history) < 5:
-        # Geçmiş veri yoksa bile getiri bilgilerini göster
-        return {
-            "code": fund_code, "prices": [], "dates": [],
-            "cur_price": round(cur_price, 6), "cur_date": cur_date,
-            "ret_1m": round(ret_1m * 100, 2) if ret_1m is not None else None,
-            "ret_3m": round(ret_3m * 100, 2) if ret_3m is not None else None,
-            "ret_6m": round(ret_6m * 100, 2) if ret_6m is not None else None,
-            "vol": 0, "maxdd": 0, "sharpe": 0,
-            "tdir": "N/A", "ma_sig": "—", "ma10": 0, "ma20": 0,
-            "npoints": 0,
-        }
-
-    history.sort(key=lambda h: h["date"])
-    prices = [h["price"] for h in history]
-    dates = [h["date"] for h in history]
-
-    chart_prices = prices[-30:]
-    chart_dates = dates[-30:]
-
-    daily_ret = np.diff(prices) / prices[:-1]
-    vol = float(np.std(daily_ret) * np.sqrt(252))
-    cummax = np.maximum.accumulate(prices)
-    maxdd = float(np.max((cummax - prices) / cummax))
-    avg_dr = float(np.mean(daily_ret))
-    sharpe = float((avg_dr * 252 - deposit_rate) / vol) if vol > 0 else 0
-
-    if len(prices) >= 10:
-        slope = float(np.polyfit(np.arange(10), prices[-10:], 1)[0])
-        tdir = "Yükseliş 🔼" if slope > 0 else "Düşüş 🔽"
-    else:
-        tdir = "N/A"
-
-    ma10 = float(np.mean(prices[-10:])) if len(prices) >= 10 else prices[-1]
-    ma20 = float(np.mean(prices[-20:])) if len(prices) >= 20 else prices[-1]
-    ma_sig = "🟢 AL" if ma10 > ma20 else "🔴 SAT"
-
-    return {
-        "code": fund_code, "prices": chart_prices, "dates": chart_dates,
-        "cur_price": round(cur_price, 6), "cur_date": cur_date,
-        "ret_1m": round(ret_1m * 100, 2) if ret_1m is not None else None,
-        "ret_3m": round(ret_3m * 100, 2) if ret_3m is not None else None,
-        "ret_6m": round(ret_6m * 100, 2) if ret_6m is not None else None,
-        "vol": round(vol * 100, 2), "maxdd": round(maxdd * 100, 2),
-        "sharpe": round(sharpe, 2), "tdir": tdir,
-        "ma_sig": ma_sig, "ma10": round(ma10, 6), "ma20": round(ma20, 6),
-        "npoints": len(prices),
-    }
 
 
 # ── HTML TEMPLATE ──────────────────────────────────────────────────────────────
@@ -349,7 +302,7 @@ box-shadow:0 4px 15px rgba(79,140,255,.3);transition:all .3s}
 .sum-card .lb{font-size:.85rem;color:var(--txt2);margin-bottom:6px}
 .sum-card .vl{font-size:1.8rem;font-weight:700}
 .stitle{display:flex;align-items:center;gap:10px;margin:30px 0 15px;font-size:1.4rem;font-weight:700}
-.rec-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(400px,1fr));gap:16px;margin-bottom:30px}
+.rec-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:16px;margin-bottom:30px}
 .fc{background:var(--card);border:1px solid var(--brd);border-radius:14px;padding:20px;
 cursor:pointer;transition:all .3s;position:relative;overflow:hidden;text-decoration:none;color:inherit;display:block}
 .fc:hover{border-color:var(--acc);background:var(--cardh);transform:translateY(-2px);
@@ -361,21 +314,21 @@ justify-content:center;font-weight:700;font-size:.9rem}
 .fc .fcode{background:var(--bg);padding:4px 12px;border-radius:6px;font-weight:700;font-size:1rem;
 color:var(--accl);letter-spacing:1px}
 .fc .fname{font-size:.85rem;color:var(--txt2);line-height:1.3;flex:1}
-.pred{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:20px;
-font-size:.8rem;font-weight:600;margin-bottom:10px}
-.pred.up{background:rgba(0,214,143,.15);color:var(--grn)}
-.pred.neutral{background:rgba(255,165,2,.15);color:var(--org)}
-.pred.down{background:rgba(255,71,87,.15);color:var(--red)}
 .mets{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .met{background:var(--bg);padding:8px 12px;border-radius:8px}
 .met .ml{font-size:.7rem;color:var(--txt2)}
 .met .mv{font-size:1rem;font-weight:600}
 .mv.pos{color:var(--grn)}.mv.neg{color:var(--red)}
+.risk-badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:.8rem;font-weight:700}
 .sbar{margin-top:12px;height:6px;background:var(--bg);border-radius:3px;overflow:hidden}
 .sbar-f{height:100%;border-radius:3px;transition:width .8s}
 .sbar-l{display:flex;justify-content:space-between;margin-top:4px;font-size:.75rem;color:var(--txt2)}
 .sbd{display:grid;grid-template-columns:repeat(5,1fr);gap:4px;margin-top:8px;text-align:center}
 .sbd .sl{font-size:.6rem;color:var(--txt2)}.sbd .sv{font-size:.7rem;font-weight:600}
+.prob{font-size:.85rem;padding:6px 12px;border-radius:8px;text-align:center;margin:8px 0;font-weight:600}
+.prob.high{background:rgba(0,214,143,.12);color:var(--grn)}
+.prob.mid{background:rgba(255,165,2,.12);color:var(--org)}
+.prob.low{background:rgba(255,71,87,.12);color:var(--red)}
 .tc{background:var(--card);border:1px solid var(--brd);border-radius:14px;overflow:hidden;margin:20px 0}
 .tabs{display:flex;border-bottom:1px solid var(--brd)}
 .tab{padding:12px 24px;cursor:pointer;color:var(--txt2);font-weight:500;border-bottom:2px solid transparent;transition:.3s}
@@ -394,15 +347,10 @@ justify-content:center;align-items:center;flex-direction:column;gap:20px}
 .spin{width:50px;height:50px;border:4px solid var(--brd);border-top-color:var(--acc);
 border-radius:50%;animation:sp 1s linear infinite}
 @keyframes sp{to{transform:rotate(360deg)}}
-.det-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;margin:20px 0}
-.det-item{background:var(--bg);padding:12px;border-radius:8px}
-.det-item .dl{font-size:.75rem;color:var(--txt2);margin-bottom:4px}
-.det-item .dv{font-size:1.1rem;font-weight:600}
-.chart-box{background:var(--bg);border-radius:12px;padding:20px;margin-top:20px}
-.chart-box h3{color:var(--txt2);font-size:.9rem;margin-bottom:15px}
-.back-link{display:inline-block;margin-bottom:20px;color:var(--acc);text-decoration:none;
-font-size:1rem;border:1px solid var(--brd);padding:8px 16px;border-radius:8px}
-.back-link:hover{background:var(--card)}
+.info-box{background:var(--bg);border:1px solid var(--brd);border-radius:12px;padding:20px;margin:20px 0}
+.info-box h3{color:var(--accl);margin-bottom:12px;font-size:1rem}
+.info-box p{color:var(--txt2);font-size:.85rem;line-height:1.6;margin-bottom:8px}
+.info-box strong{color:var(--txt)}
 @media(max-width:768px){.ctn{padding:10px}.hdr h1{font-size:1.5rem}
 .rec-grid{grid-template-columns:1fr}.inp-g{flex-direction:column}
 .inp-g input{width:100%}.btn{width:100%}table{font-size:.8rem}
@@ -439,7 +387,7 @@ HOME_PAGE = HTML_TEMPLATE.replace(r"{% block content %}{% endblock %}", r"""
 {% block content %}
 <div class="inp-sec">
 <h2>🏦 Banka Mevduat Faiz Oranınızı Girin</h2>
-<form action="/analyze" method="POST" class="inp-g" onsubmit="showLoad('TEFAS verileri çekiliyor... Bu işlem 15-20 saniye sürebilir')">
+<form action="/analyze" method="POST" class="inp-g" onsubmit="showLoad('TEFAS verileri çekiliyor... 15-20 saniye sürebilir')">
 <label>Yıllık Brüt Mevduat Faizi:</label>
 <input type="number" name="rate" value="40" min="1" max="200" step="0.5" required>
 <label>%</label>
@@ -463,35 +411,47 @@ RESULTS_PAGE = HTML_TEMPLATE.replace(r"{% block content %}{% endblock %}", r"""
 <div class="sum-card"><div class="lb">Mevduat Üstü Fon</div><div class="vl" style="color:var(--grn)">{{ above }}</div></div>
 </div>
 
+<div class="info-box">
+<h3>📌 Bu Puan Ne Demek?</h3>
+<p><strong>Puan (0-100):</strong> Fonun gelecek ay mevduatı geçme olasılığını ve güvenilirliğini gösterir. Yüksek puan = hem mevduatı geçme ihtimali yüksek hem de riski düşük/öngörülebilir.</p>
+<p><strong>Risk (1-7):</strong> TEFAS'ın kendi risk skalası. 1 = Para Piyasası (neredeyse mevduat kadar güvenli), 7 = Serbest fon (yüksek risk, yüksek dalgalanma).</p>
+<p><strong>Geçme Olasılığı:</strong> Son 1, 3 ve 6 aylık dönemlerde kaçında mevduatı geçtiğine ve risk seviyesine göre tahmin edilir.</p>
+<p><strong>Beklenen Aylık:</strong> Geçmiş getirilerin %30-40 güvenlik indirimiyle hesaplanmış konservatif tahmin. <u>Garanti değildir.</u></p>
+</div>
+
 <div class="stitle"><span style="font-size:1.6rem">⭐</span> Önerilen Fonlar</div>
 <div class="rec-grid">
         {% for f in recommended %}
-<a href="/fund/{{ f.code }}?rate={{ rate }}&date={{ date }}" class="fc" style="text-decoration:none;color:inherit">
+<div class="fc" onclick="location.href='https://www.tefas.gov.tr/tr/fon-ara?FonKod={{ f.code }}'">
 <div class="rank">{{ loop.index }}</div>
 <div class="fh">
 <span class="fcode">{{ f.code }}</span>
 <span class="fname">{{ f.name }}</span>
 </div>
-<div class="pred {{ f.picon }}">{{ f.pred }}</div>
+<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+<span class="risk-badge" style="background:{{ f.risk_color }}22;color:{{ f.risk_color }}">{{ f.risk_label }}</span>
+</div>
 <div class="mets">
 <div class="met"><div class="ml">Fiyat</div><div class="mv">{{ "%.4f"|format(f.price) }}</div></div>
 <div class="met"><div class="ml">Son 1 Ay (%)</div><div class="mv {{ 'pos' if f.r1m > 0 else 'neg' }}">{{ "%+.2f"|format(f.r1m) }}%</div></div>
 <div class="met"><div class="ml">Son 3 Ay (%)</div><div class="mv {{ 'pos' if f.r3m > 0 else 'neg' }}">{{ "%+.2f"|format(f.r3m) }}%</div></div>
-<div class="met"><div class="ml">Son 6 Ay (%)</div><div class="mv {{ 'pos' if f.r6m != None and f.r6m > 0 else ('neg' if f.r6m != None else '') }}">{{ "%+.2f"|format(f.r6m) if f.r6m != None else "—" }}{% if f.r6m != None %}%{% endif %}</div></div>
-<div class="met"><div class="ml">Portföy (₺)</div><div class="mv" style="font-size:.85rem">{{ fmt_size(f.size) }}</div></div>
-<div class="met"><div class="ml">Yatırımcı</div><div class="mv">{{ fmt_num(f.investors) }}</div></div>
+<div class="met"><div class="ml">Son 6 Ay (%)</div><div class="mv {{ 'pos' if f.r6m != None and f.r6m > 0 else ('neg' if f.r6m != None else '') }}">{{ "%+.2f"|format(f.r6m) if f.r6m != None else "—" }}{{ "%" if f.r6m != None else "" }}</div></div>
+<div class="met"><div class="ml">Beklenen Aylık</div><div class="mv pos">{{ "+%.2f"|format(f.expected_monthly) }}%</div></div>
+<div class="met"><div class="ml">Mevduat Aylık</div><div class="mv" style="color:var(--org)">{{ f.deposit_monthly }}%</div></div>
 </div>
+{% set prob_class = 'high' if 'Çok Yüksek' in f.probability or 'Yüksek' in f.probability else ('mid' if 'Orta' in f.probability else 'low') %}
+<div class="prob {{ prob_class }}">🎯 Geçme Olasılığı: {{ f.probability }}</div>
 {% set sc = "#00d68f" if f.score >= 70 else ("#4f8cff" if f.score >= 50 else ("#ffa502" if f.score >= 30 else "#ff4757")) %}
 <div class="sbar"><div class="sbar-f" style="width:{{ f.score }}%;background:{{ sc }}"></div></div>
-<div class="sbar-l"><span>Toplam Skor</span><span style="color:{{ sc }};font-weight:700">{{ f.score }}/100</span></div>
+<div class="sbar-l"><span>Güvenilirlik Puanı</span><span style="color:{{ sc }};font-weight:700">{{ f.score }}/100</span></div>
 <div class="sbd">
-<div><div class="sl">Momentum</div><div class="sv">{{ f.s_mom }}/30</div></div>
-<div><div class="sl">Risk-Getiri</div><div class="sv">{{ f.s_risk }}/25</div></div>
+<div><div class="sl">Geçme Sıklığı</div><div class="sv">{{ f.s_beat }}/35</div></div>
+<div><div class="sl">Risk Skoru</div><div class="sv">{{ f.s_risk }}/25</div></div>
 <div><div class="sl">İstikrar</div><div class="sv">{{ f.s_stab }}/20</div></div>
-<div><div class="sl">Trend</div><div class="sv">{{ f.s_trend }}/15</div></div>
+<div><div class="sl">Fon Büyüklüğü</div><div class="sv">{{ f.s_size }}/10</div></div>
 <div><div class="sl">Yatırımcı</div><div class="sv">{{ f.s_inv }}/10</div></div>
 </div>
-</a>
+</div>
 {% endfor %}
 </div>
 
@@ -500,8 +460,9 @@ RESULTS_PAGE = HTML_TEMPLATE.replace(r"{% block content %}{% endblock %}", r"""
 {% endif %}
 
 <div class="disc">
-⚠️ <strong>Önemli Uyarı:</strong> Bu uygulama algoritmik analiz yapmaktadır ve yatırım tavsiyesi değildir.
-Geçmiş performans gelecekteki getirilerin garantisi değildir. Yatırım kararlarınızı kendiniz verin.
+⚠️ <strong>Önemli Uyarı:</strong> Bu uygulama geçmiş verilere dayalı olasılık hesabı yapmaktadır. <u>Yatırım tavsiyesi değildir.</u><br>
+Geçmiş performans gelecekteki getirilerin garantisi değildir. Yüksek puanlı bir fon bile zarar edebilir.<br>
+Karar verirken fonun <strong>risk seviyesini (1-7)</strong> mutlaka dikkate alın.
 </div>
 
 <div class="stitle"><span style="font-size:1.6rem">📋</span> Tüm Fonlar</div>
@@ -512,7 +473,7 @@ Geçmiş performans gelecekteki getirilerin garantisi değildir. Yatırım karar
 </div>
 <div style="overflow-x:auto">
 <table>
-<thead><tr><th>#</th><th>Kod</th><th>Fon Adı</th><th>Fiyat</th><th>1A %</th><th>3A %</th><th>6A %</th><th>Skor</th><th>Tahmin</th><th>Risk</th></tr></thead>
+<thead><tr><th>#</th><th>Kod</th><th>Fon Adı</th><th>Risk</th><th>1A %</th><th>3A %</th><th>6A %</th><th>Beklenen</th><th>Geçme Ol.</th><th>Puan</th></tr></thead>
 <tbody id="tbody"></tbody>
 </table>
 </div>
@@ -530,17 +491,17 @@ function renderTable(funds) {
         const sc = f.score>=70?'color:#00d68f':f.score>=50?'color:#4f8cff':f.score>=30?'color:#ffa502':'color:#ff4757';
         const r6m = f.r6m !== null ? (f.r6m>0?'+':'')+f.r6m+'%' : '—';
         const r6c = f.r6m !== null ? (f.r6m>0?'var(--grn)':'var(--red)') : 'var(--txt2)';
-        tb.innerHTML += `<tr onclick="location.href='/fund/${f.code}?rate={{ rate }}&date={{ date }}'">
+        tb.innerHTML += `<tr onclick="window.open('https://www.tefas.gov.tr/tr/fon-ara?FonKod=${f.code}','_blank')">
             <td>${i+1}</td>
             <td><strong style="color:var(--accl)">${f.code}</strong></td>
             <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${f.name}</td>
-            <td>${f.price.toFixed(4)}</td>
+            <td><span class="risk-badge" style="background:${f.risk_color}22;color:${f.risk_color}">${f.risk}/7</span></td>
             <td style="color:${f.r1m>0?'var(--grn)':'var(--red)'};font-weight:600">${f.r1m>0?'+':''}${f.r1m}%</td>
             <td style="color:${f.r3m>0?'var(--grn)':'var(--red)'};font-weight:600">${f.r3m>0?'+':''}${f.r3m}%</td>
             <td style="color:${r6c};font-weight:600">${r6m}</td>
+            <td style="color:var(--grn);font-weight:600">+${f.expected_monthly}%</td>
+            <td style="font-size:.8rem">${f.probability}</td>
             <td style="${sc};font-weight:700">${f.score}</td>
-            <td>${f.pred}</td>
-            <td>${f.risk_label}</td>
         </tr>`;
     });
 }
@@ -552,85 +513,6 @@ function showTab(tab, el) {
     renderTable(tab==='above'?aboveFunds:allFunds);
 }
 renderTable(aboveFunds);
-</script>
-{% endblock %}
-""")
-
-DETAIL_PAGE = HTML_TEMPLATE.replace(r"{% block content %}{% endblock %}", r"""
-{% block content %}
-<a href="/results?rate={{ rate }}" class="back-link">← Sonuçlara Dön</a>
-<a href="/" class="back-link" style="margin-left:8px">🏠 Ana Sayfa</a>
-
-<h2 style="color:var(--accl);margin:20px 0">{{ d.code }} Detaylı Analiz</h2>
-
-<div class="det-grid">
-<div class="det-item"><div class="dl">Güncel Fiyat ({{ d.cur_date }})</div><div class="dv">{{ d.cur_price }}</div></div>
-<div class="det-item"><div class="dl">Son 1 Ay (%)</div><div class="dv" style="color:{{ '#00d68f' if d.ret_1m != None and d.ret_1m>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ret_1m) if d.ret_1m != None else "—" }}{{ "%" if d.ret_1m != None else "" }}</div></div>
-<div class="det-item"><div class="dl">Son 3 Ay (%)</div><div class="dv" style="color:{{ '#00d68f' if d.ret_3m != None and d.ret_3m>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ret_3m) if d.ret_3m != None else "—" }}{{ "%" if d.ret_3m != None else "" }}</div></div>
-<div class="det-item"><div class="dl">Son 6 Ay (%)</div><div class="dv" style="color:{{ '#00d68f' if d.ret_6m != None and d.ret_6m>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ret_6m) if d.ret_6m != None else "—" }}{{ "%" if d.ret_6m != None else "" }}</div></div>
-<div class="det-item"><div class="dl">Volatilite (Yıllık)</div><div class="dv">{{ d.vol }}%</div></div>
-<div class="det-item"><div class="dl">Max Drawdown</div><div class="dv" style="color:#ff4757">-{{ d.maxdd }}%</div></div>
-<div class="det-item"><div class="dl">Sharpe Oranı</div><div class="dv" style="color:{{ '#00d68f' if d.sharpe>1 else ('#4f8cff' if d.sharpe>0 else '#ff4757') }}">{{ d.sharpe }}</div></div>
-<div class="det-item"><div class="dl">Trend</div><div class="dv">{{ d.tdir }}</div></div>
-<div class="det-item"><div class="dl">MA Sinyal</div><div class="dv" style="font-size:1.3rem">{{ d.ma_sig }}</div></div>
-<div class="det-item"><div class="dl">MA 10</div><div class="dv">{{ d.ma10 }}</div></div>
-<div class="det-item"><div class="dl">MA 20</div><div class="dv">{{ d.ma20 }}</div></div>
-</div>
-
-<div class="chart-box">
-<h3>📈 Son 30 İş Günü Fiyat Grafiği</h3>
-<canvas id="chart" width="800" height="250" style="width:100%;max-height:250px"></canvas>
-</div>
-
-<p style="color:var(--txt2);font-size:.75rem;margin-top:15px;text-align:center">{{ d.npoints }} günlük veri ile analiz edilmiştir</p>
-
-<script>
-const prices = {{ prices_json|safe }};
-const dates = {{ dates_json|safe }};
-const canvas = document.getElementById('chart');
-const ctx = canvas.getContext('2d');
-
-function draw(){
-    const rect = canvas.parentElement.getBoundingClientRect();
-    canvas.width = rect.width; canvas.height = 250;
-    const w=canvas.width-80, h=canvas.height-50, pad={t:20,l:60,r:20,b:30};
-    const mn=Math.min(...prices),mx=Math.max(...prices),rng=mx-mn||1;
-
-    ctx.clearRect(0,0,canvas.width,canvas.height);
-    ctx.strokeStyle='rgba(255,255,255,.05)';ctx.lineWidth=1;
-    for(let i=0;i<=4;i++){
-        const y=pad.t+(h/4)*i;
-        ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(canvas.width-pad.r,y);ctx.stroke();
-        ctx.fillStyle='#8b8fb0';ctx.font='10px sans-serif';ctx.textAlign='right';
-        ctx.fillText((mx-(rng/4)*i).toFixed(4),pad.l-5,y+3);
-    }
-
-    ctx.beginPath();ctx.strokeStyle='#4f8cff';ctx.lineWidth=2;
-    prices.forEach((p,i)=>{
-        const x=pad.l+(i/(prices.length-1))*w;
-        const y=pad.t+h-((p-mn)/rng)*h;
-        i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
-    });
-    ctx.stroke();
-
-    const grad=ctx.createLinearGradient(0,pad.t,0,canvas.height-pad.b);
-    grad.addColorStop(0,'rgba(79,140,255,.15)');grad.addColorStop(1,'rgba(79,140,255,0)');
-    ctx.lineTo(pad.l+w,pad.t+h);ctx.lineTo(pad.l,pad.t+h);ctx.closePath();
-    ctx.fillStyle=grad;ctx.fill();
-
-    ctx.fillStyle='#8b8fb0';ctx.font='9px sans-serif';ctx.textAlign='center';
-    const step=Math.max(1,Math.floor(dates.length/6));
-    dates.forEach((d,i)=>{if(i%step===0){
-        const x=pad.l+(i/(dates.length-1))*w;
-        ctx.fillText(d.slice(5),x,canvas.height-5);
-    }});
-
-    const lx=pad.l+w,ly=pad.t+h-((prices[prices.length-1]-mn)/rng)*h;
-    ctx.beginPath();ctx.arc(lx,ly,4,0,Math.PI*2);ctx.fillStyle='#4f8cff';ctx.fill();
-    ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();
-}
-draw();
-window.addEventListener('resize',draw);
 </script>
 {% endblock %}
 """)
@@ -650,11 +532,10 @@ def analyze():
         return "Geçersiz faiz oranı", 400
 
     dep_decimal = rate / 100
-    dep_net = dep_decimal * 0.85  # Stopaj sonrası
+    dep_net = dep_decimal * 0.85
     dep_monthly = dep_net / 12
 
     try:
-        # Bugünün verisi
         logger.info("Bugün çekiliyor...")
         today = datetime.now()
         today_str = today.strftime("%Y%m%d")
@@ -680,29 +561,25 @@ def analyze():
 
         actual_dt = datetime.strptime(actual_date_fmt, "%Y-%m-%d")
 
-        # 1 ay önce
         logger.info("1 ay önce çekiliyor...")
         m1_date = subtract_months(actual_dt, 1)
         _, m1_list = find_nearest_day(m1_date.strftime("%Y%m%d"), offset_range=range(0, 5))
         logger.info(f"1a: {len(m1_list)} fon")
 
-        # 3 ay önce
         logger.info("3 ay önce çekiliyor...")
         m3_date = subtract_months(actual_dt, 3)
         _, m3_list = find_nearest_day(m3_date.strftime("%Y%m%d"), offset_range=range(0, 5))
         logger.info(f"3a: {len(m3_list)} fon")
 
-        # 6 ay önce
         logger.info("6 ay önce çekiliyor...")
         m6_date = subtract_months(actual_dt, 6)
         _, m6_list = find_nearest_day(m6_date.strftime("%Y%m%d"), offset_range=range(0, 7))
         logger.info(f"6a: {len(m6_list)} fon")
 
-        # Skorları hesapla
         scores = calculate_scores(today_list, m1_list, m3_list, m6_list, dep_net)
 
         above_list = [s for s in scores if s["beats"]]
-        recommended = [s for s in above_list if s["score"] >= 40][:6]
+        recommended = [s for s in above_list if s["score"] >= 30][:15]
 
         import json as _json
 
@@ -722,8 +599,8 @@ def analyze():
             above=len(above_list),
             rate=rate,
             recommended=recommended,
-            all_json=_json.dumps(scores[:30]),
-            above_json=_json.dumps(above_list[:15]),
+            all_json=_json.dumps(scores[:50]),
+            above_json=_json.dumps(above_list[:25]),
             fmt_size=fmt_size,
             fmt_num=fmt_num,
         )
@@ -731,52 +608,6 @@ def analyze():
     except Exception as e:
         logger.error(f"Hata: {e}", exc_info=True)
         return f"Analiz hatası: {e}", 500
-
-
-@app.route("/results")
-def results_page():
-    rate = request.args.get("rate", 40)
-    return render_template_string(HTML_TEMPLATE.replace(
-        r"{% block content %}{% endblock %}",
-        """{% block content %}
-        <div class="inp-sec">
-            <h2>Yeniden analiz yapmak ister misiniz?</h2>
-            <form action="/analyze" method="POST" class="inp-g" onsubmit="showLoad('TEFAS verileri çekiliyor...')">
-                <label>Yıllık Brüt Mevduat Faizi:</label>
-                <input type="number" name="rate" value="{rate}" min="1" max="200" step="0.5" required>
-                <label>%</label>
-                <button type="submit" class="btn">🔍 Tekrar Analiz Et</button>
-            </form>
-        </div>
-        {% endblock %}""".format(rate=rate)
-    ))
-
-
-@app.route("/fund/<code>")
-def fund_detail_page(code):
-    rate = float(request.args.get("rate", 40))
-    ref_date = request.args.get("date", None)
-    detail = analyze_detail(code.upper(), rate / 100, ref_date=ref_date)
-
-    if not detail:
-        return render_template_string(HTML_TEMPLATE.replace(
-            r"{% block content %}{% endblock %}",
-            """{% block content %}
-            <div class="inp-sec">
-                <h2 style="color:var(--red)">{code} için yeterli veri bulunamadı</h2>
-                <a href="/" class="btn" style="display:inline-block;margin-top:20px;text-decoration:none">← Geri Dön</a>
-            </div>
-            {% endblock %}""".format(code=code.upper())
-        ))
-
-    import json as _json
-
-    return render_template_string(DETAIL_PAGE,
-        d=detail,
-        rate=rate,
-        prices_json=_json.dumps(detail["prices"]),
-        dates_json=_json.dumps(detail["dates"]),
-    )
 
 
 if __name__ == "__main__":
