@@ -1,24 +1,15 @@
 """
 TEFAS Fon Tavsiye Sistemi v2
 Hedef: Mevduat faizini ANLAMLI şekilde geçebilecek fonları bulmak.
-
-Mantık: Eğer mevduat aylık %3 getiriyorsa, sana %3.02 getiren fonu tavsiye etmenin anlamı yok.
-Risk seviyesine göre minimum geçme farkı uygulanır:
-- Risk 1 (Para Piyasası): en az +0.50% fark
-- Risk 2 (Borçlanma): en az +0.70% fark
-- Risk 4 (Karma/Altın/Döviz): en az +1.00% fark
-- Risk 6 (Hisse): en az +2.00% fark
-- Risk 7 (Serbest): en az +3.00% fark
-
-Böylece her önerilen fon, riskine göre "geçmeye değecek" bir getiri sunar.
 """
 import logging
 from datetime import datetime, timedelta
 import calendar
 import time
 import json
+import statistics
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import numpy as np
 import requests
 from flask import Flask, render_template_string, request
 
@@ -42,6 +33,7 @@ def subtract_months(dt, months):
 
 
 INFO_URL = "https://www.tefas.gov.tr/api/funds/fonGnlBlgSiraliGetir"
+DETAIL_URL = "https://www.tefas.gov.tr/api/funds/fonBilgiGetir"
 
 API_HEADERS = {
     "Accept": "*/*",
@@ -89,10 +81,11 @@ def find_nearest_day(base_date_str, offset_range=range(0, 7)):
 
 
 # ═══════════════════════════════════════════════════════════════
-# RİSK SEVİYESİ (Fon adından TEFAS skalası)
+# RİSK SEVİYESİ
 # ═══════════════════════════════════════════════════════════════
 
 def get_risk_level(fund_name):
+    """Fon adından tahmini risk (fallback)."""
     n = fund_name.upper()
     if "PARA PİYASASI" in n or "PARA PIYASASI" in n:
         return 1
@@ -100,16 +93,16 @@ def get_risk_level(fund_name):
         return 2
     if "KAMU" in n and ("BORÇ" in n or "TAHVİL" in n or "TAHVIL" in n):
         return 2
-    if "ALTIN" in n:
-        return 5
-    if "GÜMÜŞ" in n or "GUMUS" in n:
-        return 5
-    if "DÖVİZ" in n or "DOVIZ" in n or "DOLAR" in n or "EURO" in n:
-        return 4
     if "KARMA" in n:
         return 4
     if "DEĞİŞKEN" in n or "DEGISKEN" in n:
         return 4
+    if "DÖVİZ" in n or "DOVIZ" in n or "DOLAR" in n or "EURO" in n:
+        return 4
+    if "ALTIN" in n:
+        return 5
+    if "GÜMÜŞ" in n or "GUMUS" in n:
+        return 5
     if "EMTİA" in n or "EMTIA" in n:
         return 5
     if "HİSSE" in n or "HISSE" in n:
@@ -119,33 +112,7 @@ def get_risk_level(fund_name):
     return 5
 
 
-RISK_LABELS = {
-    1: ("1/7 - Çok Düşük", "#00d68f"),
-    2: ("2/7 - Düşük", "#4f8cff"),
-    3: ("3/7 - Orta Düşük", "#4f8cff"),
-    4: ("4/7 - Orta", "#ffa502"),
-    5: ("5/7 - Orta Yüksek", "#ffa502"),
-    6: ("6/7 - Yüksek", "#ff4757"),
-    7: ("7/7 - Çok Yüksek", "#ff4757"),
-}
-
-RISK_NAMES = {
-    1: "Para Piyasası",
-    2: "Borçlanma / Tahvil",
-    3: "Orta Düşük Risk",
-    4: "Karma / Değişken",
-    5: "Emtia / Altın / Yabancı",
-    6: "Hisse Senedi",
-    7: "Serbest",
-}
-
-# ═══════════════════════════════════════════════════════════════
-# GERÇEK RİSK SEVİYESİ (API'den fonKategori bazlı)
-# ═══════════════════════════════════════════════════════════════
-
-DETAIL_URL = "https://www.tefas.gov.tr/api/funds/fonBilgiGetir"
-
-# fonKategori → TEFAS risk seviyesi (1-7)
+# fonKategori → risk (1-7)
 CATEGORY_RISK = {
     "Para Piyasası Fonu": 1,
     "Kısa Vadeli Borçlanma Araçları Fonu": 2,
@@ -155,7 +122,7 @@ CATEGORY_RISK = {
     "Eurobond Fonu": 3,
     "Değişken Fon": 4,
     "Karma Fon": 4,
-    "Katılım Fonu": 4,       # Altına/special'e göre değişir, default 4
+    "Katılım Fonu": 4,
     "Altın Fonu": 5,
     "Kıymetli Madenler Fonu": 5,
     "Yabancı Fon Sepeti Fonu": 5,
@@ -167,54 +134,72 @@ CATEGORY_RISK = {
     "Gayrimenkul Yatırım Fonları": 6,
 }
 
+RISK_LABELS = {
+    1: ("1/7 - Çok Düşük", "#00d68f"),
+    2: ("2/7 - Düşük", "#4f8cff"),
+    3: ("3/7 - Orta Düşük", "#4f8cff"),
+    4: ("4/7 - Orta", "#ffa502"),
+    5: ("5/7 - Orta Yüksek", "#ffa502"),
+    6: ("6/7 - Yüksek", "#ff4757"),
+    7: ("7/7 - Çok Yüksek", "#ff4757"),
+}
 
-def fetch_real_risk(fund_codes):
-    """Önerilen fonlar için TEFAS API'den gerçek fonKategori çekip risk seviyesini bulur."""
+
+def _fetch_one_risk(code):
+    """Tek fon için API'den risk çek."""
+    try:
+        resp = requests.post(DETAIL_URL, json={"fonKodu": code, "dil": "TR"},
+                            headers=API_HEADERS, timeout=8)
+        data = resp.json()
+        if data.get("resultList"):
+            cat = data["resultList"][0].get("fonKategori", "")
+            name = data["resultList"][0].get("fonUnvan", "").upper()
+            # Katılım Fonları alt-kategori
+            if cat == "Katılım Fonu":
+                if "PARA PİYASASI" in name or "PARA PIYASASI" in name:
+                    return code, 1
+                elif "ALTIN" in name:
+                    return code, 5
+                elif "HİSSE" in name or "HISSE" in name:
+                    return code, 6
+                return code, 4
+            risk = CATEGORY_RISK.get(cat)
+            if risk:
+                return code, risk
+    except Exception:
+        pass
+    return code, None
+
+
+def fetch_real_risks(fund_codes, max_workers=10):
+    """Paralel API çağrısı ile gerçek risk seviyelerini çek."""
     risk_map = {}
-    for code in fund_codes:
-        try:
-            resp = requests.post(DETAIL_URL, json={"fonKodu": code, "dil": "TR"},
-                                headers=API_HEADERS, timeout=10)
-            data = resp.json()
-            if data.get("resultList"):
-                cat = data["resultList"][0].get("fonKategori", "")
-                # Katılım Fonları için alt-kategori kontrolü
-                if cat == "Katılım Fonu":
-                    name = data["resultList"][0].get("fonUnvan", "").upper()
-                    if "PARA PİYASASI" in name or "PARA PIYASASI" in name:
-                        risk_map[code] = 1
-                    elif "ALTIN" in name:
-                        risk_map[code] = 5
-                    elif "HİSSE" in name or "HISSE" in name:
-                        risk_map[code] = 6
-                    else:
-                        risk_map[code] = CATEGORY_RISK.get(cat, 4)
-                elif cat in CATEGORY_RISK:
-                    risk_map[code] = CATEGORY_RISK[cat]
-                else:
-                    risk_map[code] = None  # Bilinmeyen kategori
-            time.sleep(0.3)
-        except Exception:
-            pass
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_fetch_one_risk, code): code for code in fund_codes}
+            for future in as_completed(futures, timeout=20):
+                code, risk = future.result()
+                if risk is not None:
+                    risk_map[code] = risk
+    except Exception as e:
+        logger.warning(f"Risk çekme kısmen başarısız: {e}")
     return risk_map
+
 
 # ═══════════════════════════════════════════════════════════════
 # MİNİMUM MEVDUAT FARKI (YAYILIM)
-# Bir fonun önerilebilmesi için mevduat üzerinde olması gereken
-# minimum aylık getiri farkı. Risk arttıkça gereken fark da artar.
 # ═══════════════════════════════════════════════════════════════
 
 MIN_SPREAD = {
-    1: 0.005,   # +0.50% - Çok güvenli, az fark yeterli
-    2: 0.007,   # +0.70% - Güvenli, orta fark
+    1: 0.005,   # +0.50%
+    2: 0.007,   # +0.70%
     3: 0.008,   # +0.80%
-    4: 0.010,   # +1.00% - Orta risk, anlamlı fark gerek
-    5: 0.015,   # +1.50% - Yüksek risk
-    6: 0.020,   # +2.00% - Hisse, çok yüksek fark gerek
-    7: 0.030,   # +3.00% - Serbest, ekstra yüksek fark gerek
+    4: 0.010,   # +1.00%
+    5: 0.015,   # +1.50%
+    6: 0.020,   # +2.00%
+    7: 0.030,   # +3.00%
 }
 
-# Skorlama için risk çarpanı (düşük risk = yüksek çarpan)
 RISK_MULT = {1: 1.0, 2: 0.9, 3: 0.8, 4: 0.65, 5: 0.5, 6: 0.35, 7: 0.2}
 
 
@@ -223,7 +208,7 @@ RISK_MULT = {1: 1.0, 2: 0.9, 3: 0.8, 4: 0.65, 5: 0.5, 6: 0.35, 7: 0.2}
 # ═══════════════════════════════════════════════════════════════
 
 def calculate_scores(today_list, m1_list, m3_list, m6_list, deposit_annual_pct):
-    deposit_monthly = (deposit_annual_pct / 100 * 0.85) / 12  # Aylık net (decimal)
+    deposit_monthly = (deposit_annual_pct / 100 * 0.85) / 12
 
     results = []
     m1_map = {r["fonKodu"]: r for r in m1_list}
@@ -237,7 +222,6 @@ def calculate_scores(today_list, m1_list, m3_list, m6_list, deposit_annual_pct):
         size = row.get("portfoyBuyukluk", 0) or 0
         inv_now = row.get("kisiSayisi", 0) or 0
 
-        # Temel filtreler
         if price_now <= 0:
             continue
         if (row.get("tedPaySayisi") or 0) <= 0:
@@ -263,8 +247,7 @@ def calculate_scores(today_list, m1_list, m3_list, m6_list, deposit_annual_pct):
         avg_3m = ret_3m / 3 if ret_3m else None
         avg_6m = ret_6m / 6 if ret_6m else None
 
-        # ── BEKLENEN AYLIK GETİRİ ──
-        # Uzun dönem ortalamasına daha fazla ağırlık (daha güvenilir)
+        # Beklenen aylık getiri
         if avg_6m is not None:
             expected = avg_6m * 0.50 + avg_3m * 0.30 + avg_1m * 0.20
         elif avg_3m is not None:
@@ -272,32 +255,24 @@ def calculate_scores(today_list, m1_list, m3_list, m6_list, deposit_annual_pct):
         else:
             expected = avg_1m
 
-        # Risk seviyesi
         risk = get_risk_level(name)
         risk_label, risk_color = RISK_LABELS.get(risk, ("?/7", "#fff"))
 
-        # ── MEVDUAT FARKI (en önemli metrik) ──
         spread = expected - deposit_monthly
         spread_pct = round(spread * 100, 2)
 
-        # ── MİNİMUM FARK KONTROLÜ ──
         min_spread = MIN_SPREAD.get(risk, 0.01)
         passes = spread >= min_spread
 
-        # ── MEVDUATI GEÇME SIKLIĞI ──
         beat_1m = ret_1m > deposit_monthly
         beat_3m_avg = (ret_3m / 3) > deposit_monthly if ret_3m else False
         beat_6m_avg = (ret_6m / 6) > deposit_monthly if ret_6m else False
         beats_count = sum([beat_1m, beat_3m_avg, beat_6m_avg])
 
-        # ── PUAN HESABI (100 puan) ──
-
-        # 1) Risk Ayarlı Getiri Prim Puanı (40 puan)
-        #    Mevduat farkı ne kadar büyük ve risk ne kadar düşükse puan o kadar yüksek
+        # Puan hesabı
         risk_mult = RISK_MULT.get(risk, 0.5)
         s_spread = min(max(spread_pct, 0) * risk_mult * 15, 40)
 
-        # 2) Tutarlılık (25 puan) — Kaç dönemde mevduatı geçti?
         if beats_count == 3:
             s_cons = 25
         elif beats_count == 2:
@@ -307,12 +282,12 @@ def calculate_scores(today_list, m1_list, m3_list, m6_list, deposit_annual_pct):
         else:
             s_cons = 0
 
-        # 3) Getiri İstikrarı (15 puan) — Aylık getiriler arası tutarlılık
         if avg_6m is not None and avg_3m is not None:
             returns = [avg_1m, avg_3m, avg_6m]
-            avg_ret = np.mean(returns)
-            if avg_ret > 0:
-                cv = np.std(returns) / avg_ret
+            avg_ret = sum(returns) / len(returns)
+            if avg_ret > 0 and len(returns) > 1:
+                std = statistics.stdev(returns)
+                cv = std / avg_ret
                 stability = max(0, 1 - min(cv, 1))
                 s_stab = round(stability * 15)
             else:
@@ -323,7 +298,6 @@ def calculate_scores(today_list, m1_list, m3_list, m6_list, deposit_annual_pct):
         else:
             s_stab = 3
 
-        # 4) Fon Büyüklüğü (12 puan)
         if size > 5e9:
             s_size = 12
         elif size > 1e9:
@@ -335,7 +309,6 @@ def calculate_scores(today_list, m1_list, m3_list, m6_list, deposit_annual_pct):
         else:
             s_size = 2
 
-        # 5) Yatırımcı Sayısı (8 puan)
         if inv_now > 50000:
             s_inv = 8
         elif inv_now > 10000:
@@ -347,7 +320,7 @@ def calculate_scores(today_list, m1_list, m3_list, m6_list, deposit_annual_pct):
 
         total = round(s_spread + s_cons + s_stab + s_size + s_inv, 1)
 
-        # ── GEÇME OLASILIĞI ──
+        # Geçme olasılığı
         if beats_count == 3 and spread_pct >= 1.5:
             prob = "Çok Yüksek (%85+)"
         elif beats_count == 3 and spread_pct >= 0.7:
@@ -418,7 +391,7 @@ background:linear-gradient(135deg,var(--acc),var(--grn));
 -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;margin-bottom:8px}
 .hdr p{color:var(--txt2);font-size:1rem}
 .inp-sec{background:var(--card);border:1px solid var(--brd);border-radius:16px;padding:30px;margin:20px 0;text-align:center}
-.inp-sec h2{color:var(--accl);margin-bottom:20px;font-size:1.2rem}
+.inp-sec h2{color:var(accl);margin-bottom:20px;font-size:1.2rem}
 .inp-g{display:flex;align-items:center;justify-content:center;gap:15px;flex-wrap:wrap}
 .inp-g input{background:var(--bg);border:2px solid var(--brd);border-radius:10px;
 padding:12px 18px;color:var(--txt);font-size:1.3rem;width:180px;text-align:center}
@@ -460,10 +433,7 @@ color:var(--accl);letter-spacing:1px}
 .risk-badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:.8rem;font-weight:700}
 .spread-box{background:linear-gradient(135deg,rgba(0,214,143,.1),rgba(0,214,143,.05));
 border:1px solid rgba(0,214,143,.3);border-radius:10px;padding:12px;margin:10px 0;text-align:center}
-.spread-box.neg{background:linear-gradient(135deg,rgba(255,71,87,.1),rgba(255,71,87,.05));
-border-color:rgba(255,71,87,.3)}
 .spread-box .sv{font-size:1.8rem;font-weight:800;color:var(--grn)}
-.spread-box.neg .sv{color:var(--red)}
 .spread-box .sl{font-size:.75rem;color:var(--txt2);margin-top:2px}
 .cmp-row{display:flex;justify-content:space-between;padding:8px 12px;background:var(--bg);
 border-radius:8px;margin:8px 0;font-size:.9rem}
@@ -547,9 +517,6 @@ Stopaj (%15) otomatik düşülür → Net aylık mevduat getirisi hesaplanır.<b
 <br><br>
 💡 <strong>Nasıl çalışır?</strong> Mevduatınızı sadece %0.01 geçen fonları değil,
 risk seviyesine göre anlamlı fark koyan fonları gösterir.
-Para piyasası fonları (Risk 1) için en az +0.50%,
-karma/altın fonları (Risk 4) için en az +1.00%,
-hisse fonları (Risk 6) için en az +2.00% fark gerekir.
 </p>
 </div>
 {% endblock %}
@@ -578,8 +545,8 @@ beklenen aylık getirisi şu minimumları geçmelidir:</p>
     <td style="color:var(--txt2)">Neredeyse mevduat kadar güvenli</td></tr>
 <tr><td style="color:#4f8cff">Risk 2 (Borçlanma)</td><td>en az <strong>{{ min_r2 }}%</strong> (+0.70% fark)</td>
     <td style="color:var(--txt2)">Düşük risk, tahvil ağırlıklı</td></tr>
-<tr><td style="color:#ffa502">Risk 4 (Karma/Altın/Döviz)</td><td>en az <strong>{{ min_r4 }}%</strong> (+1.00% fark)</td>
-    <td style="color:var(--txt2)">Orta risk, çeşitlendirilmiş</td></tr>
+<tr><td style="color:#ffa502">Risk 4 (Karma/Değişken)</td><td>en az <strong>{{ min_r4 }}%</strong> (+1.00% fark)</td>
+    <td style="color:var(--txt2)">Orta risk</td></tr>
 <tr><td style="color:#ff4757">Risk 6 (Hisse)</td><td>en az <strong>{{ min_r6 }}%</strong> (+2.00% fark)</td>
     <td style="color:var(--txt2)">Yüksek risk, hisse senedi ağırlıklı</td></tr>
 </table>
@@ -686,23 +653,23 @@ function renderTable(funds) {
         const sc = f.score>=65?'color:#00d68f':f.score>=45?'color:#4f8cff':f.score>=25?'color:#ffa502':'color:#ff4757';
         const spread_c = f.spread_pct>0?'var(--grn)':'var(--red)';
         const spread_s = f.spread_pct>0?'+':'';
-        const r6m = f.r6m !== null ? (f.r6m>0?'+':'')+f.r6m+'%' : '—';
+        const r6m = f.r6m !== null ? (f.r6m>0?'+':'')+f.r6m+'%' : '\u2014';
         const r6c = f.r6m !== null ? (f.r6m>0?'var(--grn)':'var(--red)') : 'var(--txt2)';
-        const star = f.passes ? '⭐' : '';
-        tb.innerHTML += `<tr onclick="window.open('https://www.tefas.gov.tr/tr/fon-detayli-analiz/${f.code}','_blank')">
-            <td>${star}${i+1}</td>
-            <td><strong style="color:var(--accl)">${f.code}</strong></td>
-            <td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${f.name}</td>
-            <td><span class="risk-badge" style="background:${f.risk_color}22;color:${f.risk_color}">${f.risk}/7</span></td>
-            <td style="color:${f.r1m>0?'var(--grn)':'var(--red)'};font-weight:600">${f.r1m>0?'+':''}${f.r1m}%</td>
-            <td style="color:${f.r3m>0?'var(--grn)':'var(--red)'};font-weight:600">${f.r3m>0?'+':''}${f.r3m}%</td>
-            <td style="color:${r6c};font-weight:600">${r6m}</td>
-            <td style="color:var(--grn);font-weight:600">${f.expected_monthly}%</td>
-            <td style="color:var(--org)">${f.deposit_monthly}%</td>
-            <td style="color:${spread_c};font-weight:700;font-size:.95rem">${spread_s}${f.spread_pct}%</td>
-            <td style="font-size:.8rem">${f.probability}</td>
-            <td style="${sc};font-weight:700">${f.score}</td>
-        </tr>`;
+        const star = f.passes ? '\u2b50' : '';
+        tb.innerHTML += '<tr onclick="window.open(\'https://www.tefas.gov.tr/tr/fon-detayli-analiz/'+f.code+'\',\'_blank\')">' +
+            '<td>'+star+(i+1)+'</td>' +
+            '<td><strong style="color:var(--accl)">'+f.code+'</strong></td>' +
+            '<td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+f.name+'</td>' +
+            '<td><span class="risk-badge" style="background:'+f.risk_color+'22;color:'+f.risk_color+'">'+f.risk+'/7</span></td>' +
+            '<td style="color:'+(f.r1m>0?'var(--grn)':'var(--red)')+';font-weight:600">'+(f.r1m>0?'+':'')+f.r1m+'%</td>' +
+            '<td style="color:'+(f.r3m>0?'var(--grn)':'var(--red)')+';font-weight:600">'+(f.r3m>0?'+':'')+f.r3m+'%</td>' +
+            '<td style="color:'+r6c+';font-weight:600">'+r6m+'</td>' +
+            '<td style="color:var(--grn);font-weight:600">'+f.expected_monthly+'%</td>' +
+            '<td style="color:var(--org)">'+f.deposit_monthly+'%</td>' +
+            '<td style="color:'+spread_c+';font-weight:700;font-size:.95rem">'+spread_s+f.spread_pct+'%</td>' +
+            '<td style="font-size:.8rem">'+f.probability+'</td>' +
+            '<td style="'+sc+';font-weight:700">'+f.score+'</td>' +
+            '</tr>';
     });
 }
 
@@ -785,49 +752,37 @@ def analyze():
         logger.info(f"6a: {len(m6_list)} fon")
 
         scores = calculate_scores(today_list, m1_list, m3_list, m6_list, rate)
+        logger.info(f"Skorlanan: {len(scores)} fon")
 
-        # ── GERÇEK RİSK SEVİYELERİNİ API'DEN ÇEK ──
-        # İlk 50 aday fon için TEFAS'tan gerçek fonKategori çek
-        top_candidates = scores[:50]
-        candidate_codes = [s["code"] for s in top_candidates]
-        logger.info(f"Gerçek risk çekiliyor: {len(candidate_codes)} fon...")
-        real_risk_map = fetch_real_risk(candidate_codes)
-        logger.info(f"Gerçek risk alındı: {len(real_risk_map)} fon")
+        # Gerçek riskleri paralel çek (sadece top 25, 10 thread)
+        try:
+            top_codes = [s["code"] for s in scores[:25]]
+            logger.info(f"Gerçek risk çekiliyor: {len(top_codes)} fon (paralel)...")
+            real_risk_map = fetch_real_risks(top_codes, max_workers=10)
+            logger.info(f"Gerçek risk alındı: {len(real_risk_map)} fon")
 
-        # Risk seviyelerini güncelle ve yeniden skorla
-        updated_count = 0
-        for s in scores:
-            real_risk = real_risk_map.get(s["code"])
-            if real_risk is not None and real_risk != s["risk"]:
-                old_risk = s["risk"]
-                s["risk"] = real_risk
-                risk_label, risk_color = RISK_LABELS.get(real_risk, ("?/7", "#fff"))
-                s["risk_label"] = risk_label
-                s["risk_color"] = risk_color
-                # Min spread ve passes'i güncelle
-                min_spread = MIN_SPREAD.get(real_risk, 0.01)
-                s["min_required"] = round((s["deposit_monthly"] / 100 + min_spread) * 100, 2)
-                s["passes"] = s["spread_pct"] / 100 >= min_spread
-                # Skoru güncelle
-                risk_mult = RISK_MULT.get(real_risk, 0.5)
-                s["s_spread"] = round(min(max(s["spread_pct"], 0) * risk_mult * 15, 40), 1)
-                s_risk = max(0, 25 - (real_risk - 1) * 4)
-                s["score"] = round(s["s_spread"] + s["s_cons"] + s["s_stab"] + s["s_size"] + s["s_inv"], 1)
-                updated_count += 1
-                logger.info(f"  {s['code']}: Risk {old_risk} → {real_risk}")
+            for s in scores:
+                real_risk = real_risk_map.get(s["code"])
+                if real_risk is not None and real_risk != s["risk"]:
+                    old_risk = s["risk"]
+                    s["risk"] = real_risk
+                    risk_label, risk_color = RISK_LABELS.get(real_risk, ("?/7", "#fff"))
+                    s["risk_label"] = risk_label
+                    s["risk_color"] = risk_color
+                    min_spread = MIN_SPREAD.get(real_risk, 0.01)
+                    s["min_required"] = round((s["deposit_monthly"] / 100 + min_spread) * 100, 2)
+                    s["passes"] = s["spread_pct"] / 100 >= min_spread
+                    risk_mult = RISK_MULT.get(real_risk, 0.5)
+                    s["s_spread"] = round(min(max(s["spread_pct"], 0) * risk_mult * 15, 40), 1)
+                    s["score"] = round(s["s_spread"] + s["s_cons"] + s["s_stab"] + s["s_size"] + s["s_inv"], 1)
+                    logger.info(f"  {s['code']}: Risk {old_risk} -> {real_risk}")
 
-        logger.info(f"Risk güncellendi: {updated_count} fon değişti")
+            scores.sort(key=lambda x: x["score"], reverse=True)
+        except Exception as e:
+            logger.warning(f"Risk güncelleme atlandı: {e}")
 
-        # Güncel skorlara göre yeniden sırala
-        scores.sort(key=lambda x: x["score"], reverse=True)
-
-        # Önerilen: MIN_SPREAD filtresini geçen fonlar
         recommended = [s for s in scores if s["passes"]][:20]
-
-        # Mevduatı geçen: pozitif spread'li fonlar
         above = [s for s in scores if s["spread_pct"] > 0]
-
-        # MinimumRequired hesapla
         dep_pct = round(dep_monthly * 100, 2)
 
         return render_template_string(RESULTS_PAGE,
@@ -848,7 +803,7 @@ def analyze():
 
     except Exception as e:
         logger.error(f"Hata: {e}", exc_info=True)
-        return f"Analiz hatası: {e}", 500
+        return render_template_string(ERROR_PAGE)
 
 
 if __name__ == "__main__":
