@@ -1,15 +1,15 @@
 """
 TEFAS Fon Tavsiye Sistemi - Tek Dosya Versiyonu
-PythonAnywhere veya bilgisayarda çalıştırılabilir
+Render.com üzerinde çalışır
 """
 import logging
 from datetime import datetime, timedelta
-from typing import Optional
 import calendar
+import time
 
 import numpy as np
 import requests
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, render_template_string, request
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -18,9 +18,7 @@ logger = logging.getLogger(__name__)
 # ── TEFAS API ──────────────────────────────────────────────────────────────────
 
 def subtract_months(dt, months):
-    """Takvim ayı geriye alır (TEFAS ile aynı hesaplama).
-    Örnek: 5 Haziran - 1 ay = 5 Mayıs (timedelta(days=30)=6 Mayıs DEĞİL)
-    """
+    """Takvim ayı geriye alır (TEFAS ile aynı hesaplama)."""
     month = dt.month - months
     year = dt.year
     while month <= 0:
@@ -54,14 +52,23 @@ def api_body(bas_tarih, bit_tarih, fon_tipi="YAT", fon_kodu=None):
 
 
 def tefas_fetch_day(target_date: str, kind: str = "YAT"):
-    resp = requests.post(INFO_URL, json=api_body(target_date, target_date, kind), headers=API_HEADERS, timeout=30)
-    data = resp.json()
-    if data.get("errorCode") or data.get("errorMessage"):
-        return []
-    return data.get("resultList") or []
+    """Tek bir tarihin TEFAS verisini çeker."""
+    for attempt in range(3):
+        try:
+            if attempt > 0:
+                time.sleep(2)
+            resp = requests.post(INFO_URL, json=api_body(target_date, target_date, kind), headers=API_HEADERS, timeout=30)
+            data = resp.json()
+            if data.get("errorCode") or data.get("errorMessage"):
+                return []
+            return data.get("resultList") or []
+        except Exception:
+            if attempt == 2:
+                return []
 
 
-def tefas_fetch_fund_history(fund_code: str, days_back: int = 120, kind: str = "YAT"):
+def tefas_fetch_fund_history(fund_code: str, days_back: int = 200, kind: str = "YAT"):
+    """Tek bir fonun geçmiş fiyatlarını çeker (6 ay ~ 200 gün)."""
     end_dt = datetime.now()
     start_dt = end_dt - timedelta(days=days_back)
     all_rows = []
@@ -72,7 +79,7 @@ def tefas_fetch_fund_history(fund_code: str, days_back: int = 120, kind: str = "
         body = api_body(cur.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d"), kind, fund_code.upper())
         for attempt in range(3):
             try:
-                import time; time.sleep(1)
+                time.sleep(1)
                 resp = requests.post(INFO_URL, json=body, headers=API_HEADERS, timeout=30)
                 rows = resp.json().get("resultList") or []
                 for r in rows:
@@ -82,7 +89,7 @@ def tefas_fetch_fund_history(fund_code: str, days_back: int = 120, kind: str = "
                         all_rows.append({"date": key, "price": r.get("fiyat")})
                 break
             except Exception:
-                import time; time.sleep(2)
+                time.sleep(2)
         cur = chunk_end + timedelta(days=1)
     return all_rows
 
@@ -99,12 +106,14 @@ def find_nearest_day(base_date_str, offset_range=range(0, 7)):
 
 # ── SKORLAMA ───────────────────────────────────────────────────────────────────
 
-def calculate_scores(today_list, m1_list, m3_list, deposit_annual):
+def calculate_scores(today_list, m1_list, m3_list, m6_list, deposit_annual):
+    """Fonları puanlar. m1/m3/m6_list: 1/3/6 ay önceki veri listeleri."""
     deposit_m = deposit_annual / 12
     results = []
 
     m1_map = {r["fonKodu"]: r for r in m1_list}
     m3_map = {r["fonKodu"]: r for r in m3_list}
+    m6_map = {r["fonKodu"]: r for r in m6_list}
 
     for row in today_list:
         code = row["fonKodu"]
@@ -113,10 +122,20 @@ def calculate_scores(today_list, m1_list, m3_list, deposit_annual):
         size = row.get("portfoyBuyukluk", 0) or 0
         inv_now = row.get("kisiSayisi", 0) or 0
 
+        # ── İşlem görmeyen fonları filtrele ──
+        if price_now <= 0:
+            continue
+        if inv_now < 10:       # 10'dan az yatırımcı = işlem görmüyor
+            continue
+        if size < 1000:        # Çok küçük portföy = aktif değil
+            continue
+
         m1 = m1_map.get(code)
         m3 = m3_map.get(code)
+        m6 = m6_map.get(code)
         price_m1 = m1["fiyat"] if m1 else None
         price_m3 = m3["fiyat"] if m3 else None
+        price_m6 = m6["fiyat"] if m6 else None
         inv_m1 = m1.get("kisiSayisi", 0) if m1 else None
 
         if not price_m1 or price_m1 <= 0 or not price_m3 or price_m3 <= 0:
@@ -124,7 +143,7 @@ def calculate_scores(today_list, m1_list, m3_list, deposit_annual):
 
         ret_1m = (price_now / price_m1) - 1
         ret_3m = (price_now / price_m3) - 1
-        ann_ret = ret_3m  # Ana sayfada "3 Ay" göster, yıllıklaştırma yapma
+        ret_6m = (price_now / price_m6) - 1 if price_m6 and price_m6 > 0 else None
 
         # 1) MOMENTUM (30)
         mom = 0
@@ -187,8 +206,9 @@ def calculate_scores(today_list, m1_list, m3_list, deposit_annual):
         results.append({
             "code": code, "name": name, "price": price_now,
             "size": size, "investors": inv_now,
-            "r1m": round(ret_1m * 100, 2), "r3m": round(ret_3m * 100, 2),
-            "ann": round(ann_ret * 100, 1),
+            "r1m": round(ret_1m * 100, 2),
+            "r3m": round(ret_3m * 100, 2),
+            "r6m": round(ret_6m * 100, 2) if ret_6m is not None else None,
             "beats": ret_1m > deposit_m,
             "score": round(total, 1),
             "s_mom": round(mom, 1), "s_risk": round(risk, 1),
@@ -202,24 +222,21 @@ def calculate_scores(today_list, m1_list, m3_list, deposit_annual):
 
 
 def analyze_detail(fund_code, deposit_rate, ref_date=None):
-    """Detay sayfası analizi — TEFAS ile aynı metrikler."""
-    # Ana sayfayla aynı tarih referansını kullan
+    """Detay sayfası — TEFAS ile aynı metrikler: 1A, 3A, 6A."""
     if ref_date:
         ref_dt = datetime.strptime(ref_date, "%Y-%m-%d")
     else:
         ref_dt = datetime.now()
 
-    # Yeterli geçmiş veri çek (3 ay = ~120 gün)
-    history = tefas_fetch_fund_history(fund_code, days_back=120)
+    # 6 ay geçmiş = ~200 gün
+    history = tefas_fetch_fund_history(fund_code, days_back=200)
     if len(history) < 5:
         return None
 
-    # Tarihleri sırala (eski → yeni)
     history.sort(key=lambda h: h["date"])
     prices = [h["price"] for h in history]
     dates = [h["date"] for h in history]
 
-    # ── Güncel fiyat: Referans tarihine en yakın fiyat ──
     def nearest_idx(target_str):
         target = datetime.strptime(target_str, "%Y-%m-%d")
         best_i, best_d = 0, 999
@@ -233,20 +250,20 @@ def analyze_detail(fund_code, deposit_rate, ref_date=None):
     cur_price = prices[cur_idx]
     cur_date = dates[cur_idx]
 
-    # ── 1 Ay ve 3 Ay getirileri (takvim ayı, ana sayfayla aynı) ──
+    # 1 Ay, 3 Ay, 6 Ay (takvim ayı — TEFAS ile aynı)
     target_1m = subtract_months(ref_dt, 1)
     target_3m = subtract_months(ref_dt, 3)
+    target_6m = subtract_months(ref_dt, 6)
 
     p_1m = prices[nearest_idx(target_1m.strftime("%Y-%m-%d"))]
     p_3m = prices[nearest_idx(target_3m.strftime("%Y-%m-%d"))]
+    p_6m = prices[nearest_idx(target_6m.strftime("%Y-%m-%d"))]
 
     ret_1m = (cur_price / p_1m) - 1 if p_1m > 0 else 0
     ret_3m = (cur_price / p_3m) - 1 if p_3m > 0 else 0
+    ret_6m = (cur_price / p_6m) - 1 if p_6m > 0 else 0
 
-    # Yıllıklaştırılmış getiri (3 aylık üzerinden)
-    ann_ret = ((1 + ret_3m) ** 4 - 1) if ret_3m > -1 else 0
-
-    # ── Teknik analiz ──
+    # Teknik analiz
     daily_ret = np.diff(prices) / prices[:-1]
     vol = float(np.std(daily_ret) * np.sqrt(252))
     cummax = np.maximum.accumulate(prices)
@@ -255,12 +272,10 @@ def analyze_detail(fund_code, deposit_rate, ref_date=None):
     sharpe = float((avg_dr * 252 - deposit_rate) / vol) if vol > 0 else 0
 
     if len(prices) >= 10:
-        x = np.arange(10)
-        slope = float(np.polyfit(x, prices[-10:], 1)[0])
+        slope = float(np.polyfit(np.arange(10), prices[-10:], 1)[0])
         tdir = "Yükseliş 🔼" if slope > 0 else "Düşüş 🔽"
-        tstr = abs(slope / np.mean(prices[-10:])) * 100
     else:
-        tdir, tstr = "N/A", 0
+        tdir = "N/A"
 
     ma10 = float(np.mean(prices[-10:])) if len(prices) >= 10 else prices[-1]
     ma20 = float(np.mean(prices[-20:])) if len(prices) >= 20 else prices[-1]
@@ -271,9 +286,9 @@ def analyze_detail(fund_code, deposit_rate, ref_date=None):
         "cur_price": round(cur_price, 6), "cur_date": cur_date,
         "ret_1m": round(ret_1m * 100, 2),
         "ret_3m": round(ret_3m * 100, 2),
-        "ann_ret": round(ann_ret * 100, 1),
+        "ret_6m": round(ret_6m * 100, 2),
         "vol": round(vol * 100, 2), "maxdd": round(maxdd * 100, 2),
-        "sharpe": round(sharpe, 2), "tdir": tdir, "tstr": round(tstr, 4),
+        "sharpe": round(sharpe, 2), "tdir": tdir,
         "ma_sig": ma_sig, "ma10": round(ma10, 6), "ma20": round(ma20, 6),
         "npoints": len(prices),
     }
@@ -292,7 +307,7 @@ HTML_TEMPLATE = r"""
 *{margin:0;padding:0;box-sizing:border-box}
 :root{--bg:#0a0e27;--bg2:#111638;--card:#161b40;--cardh:#1c224d;--acc:#4f8cff;
 --accl:#7aa8ff;--grn:#00d68f;--red:#ff4757;--org:#ffa502;--txt:#e8eaf6;
---txt2:#8b8fb0;--brd:#252a54;--gold:#ffd700}
+--txt2:#8b8fb0;--brd:#252a54}
 body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--txt);min-height:100vh}
 body::before{content:'';position:fixed;inset:0;
 background:radial-gradient(ellipse at 20% 50%,rgba(79,140,255,.08) 0%,transparent 50%),
@@ -314,7 +329,6 @@ padding:12px 18px;color:var(--txt);font-size:1.3rem;width:180px;text-align:cente
 padding:14px 40px;border-radius:12px;font-size:1.1rem;font-weight:600;cursor:pointer;
 box-shadow:0 4px 15px rgba(79,140,255,.3);transition:all .3s}
 .btn:hover{transform:translateY(-2px);box-shadow:0 6px 25px rgba(79,140,255,.4)}
-.btn:disabled{opacity:.6;cursor:not-allowed;transform:none}
 .sum-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin:20px 0}
 .sum-card{background:var(--card);border:1px solid var(--brd);border-radius:12px;padding:20px;text-align:center}
 .sum-card .lb{font-size:.85rem;color:var(--txt2);margin-bottom:6px}
@@ -374,7 +388,6 @@ border-radius:50%;animation:sp 1s linear infinite}
 .back-link{display:inline-block;margin-bottom:20px;color:var(--acc);text-decoration:none;
 font-size:1rem;border:1px solid var(--brd);padding:8px 16px;border-radius:8px}
 .back-link:hover{background:var(--card)}
-.hidden{display:none!important}
 @media(max-width:768px){.ctn{padding:10px}.hdr h1{font-size:1.5rem}
 .rec-grid{grid-template-columns:1fr}.inp-g{flex-direction:column}
 .inp-g input{width:100%}.btn{width:100%}table{font-size:.8rem}
@@ -411,7 +424,7 @@ HOME_PAGE = HTML_TEMPLATE.replace(r"{% block content %}{% endblock %}", r"""
 {% block content %}
 <div class="inp-sec">
 <h2>🏦 Banka Mevduat Faiz Oranınızı Girin</h2>
-<form action="/analyze" method="POST" class="inp-g" onsubmit="showLoad('TEFAS verileri çekiliyor... Bu işlem 10-15 saniye sürebilir')">
+<form action="/analyze" method="POST" class="inp-g" onsubmit="showLoad('TEFAS verileri çekiliyor... Bu işlem 15-20 saniye sürebilir')">
 <label>Yıllık Brüt Mevduat Faizi:</label>
 <input type="number" name="rate" value="40" min="1" max="200" step="0.5" required>
 <label>%</label>
@@ -431,11 +444,11 @@ RESULTS_PAGE = HTML_TEMPLATE.replace(r"{% block content %}{% endblock %}", r"""
 <div class="sum-row">
 <div class="sum-card"><div class="lb">Analiz Tarihi</div><div class="vl" style="font-size:1.2rem;color:var(--acc)">{{ date }}</div></div>
 <div class="sum-card"><div class="lb">Mevduat Aylık Net (%)</div><div class="vl" style="color:var(--org)">{{ dep_net }}%</div></div>
-<div class="sum-card"><div class="lb">Analiz Edilen Fon</div><div class="vl" style="color:var(--acc)">{{ total }}</div></div>
+<div class="sum-card"><div class="lb">İşlem Gören Fon</div><div class="vl" style="color:var(--acc)">{{ total }}</div></div>
 <div class="sum-card"><div class="lb">Mevduat Üstü Fon</div><div class="vl" style="color:var(--grn)">{{ above }}</div></div>
 </div>
 
-<div class="stitle"><span style="font-size:1.6rem">⭐</span> Önerilen Fonlar (Önümüzdeki Ay)</div>
+<div class="stitle"><span style="font-size:1.6rem">⭐</span> Önerilen Fonlar</div>
 <div class="rec-grid">
         {% for f in recommended %}
 <a href="/fund/{{ f.code }}?rate={{ rate }}&date={{ date }}" class="fc" style="text-decoration:none;color:inherit">
@@ -447,9 +460,9 @@ RESULTS_PAGE = HTML_TEMPLATE.replace(r"{% block content %}{% endblock %}", r"""
 <div class="pred {{ f.picon }}">{{ f.pred }}</div>
 <div class="mets">
 <div class="met"><div class="ml">Fiyat</div><div class="mv">{{ "%.4f"|format(f.price) }}</div></div>
-<div class="met"><div class="ml">1 Ay</div><div class="mv {{ 'pos' if f.r1m > 0 else 'neg' }}">{{ "%+.2f"|format(f.r1m) }}%</div></div>
-<div class="met"><div class="ml">3 Ay</div><div class="mv {{ 'pos' if f.r3m > 0 else 'neg' }}">{{ "%+.2f"|format(f.r3m) }}%</div></div>
-<div class="met"><div class="ml">6 Aylık</div><div class="mv {{ 'pos' if f.ann > 0 else 'neg' }}\">{{ "%+.2f"|format(f.ann) }}%</div></div>
+<div class="met"><div class="ml">Son 1 Ay (%)</div><div class="mv {{ 'pos' if f.r1m > 0 else 'neg' }}">{{ "%+.2f"|format(f.r1m) }}%</div></div>
+<div class="met"><div class="ml">Son 3 Ay (%)</div><div class="mv {{ 'pos' if f.r3m > 0 else 'neg' }}">{{ "%+.2f"|format(f.r3m) }}%</div></div>
+<div class="met"><div class="ml">Son 6 Ay (%)</div><div class="mv {{ 'pos' if f.r6m != None and f.r6m > 0 else ('neg' if f.r6m != None else '') }}">{{ "%+.2f"|format(f.r6m) if f.r6m != None else "—" }}{% if f.r6m != None %}%{% endif %}</div></div>
 <div class="met"><div class="ml">Portföy (₺)</div><div class="mv" style="font-size:.85rem">{{ fmt_size(f.size) }}</div></div>
 <div class="met"><div class="ml">Yatırımcı</div><div class="mv">{{ fmt_num(f.investors) }}</div></div>
 </div>
@@ -484,7 +497,7 @@ Geçmiş performans gelecekteki getirilerin garantisi değildir. Yatırım karar
 </div>
 <div style="overflow-x:auto">
 <table>
-<thead><tr><th>#</th><th>Kod</th><th>Fon Adı</th><th>Fiyat</th><th>1A %</th><th>3A %</th><th>Skor</th><th>Tahmin</th><th>Risk</th></tr></thead>
+<thead><tr><th>#</th><th>Kod</th><th>Fon Adı</th><th>Fiyat</th><th>1A %</th><th>3A %</th><th>6A %</th><th>Skor</th><th>Tahmin</th><th>Risk</th></tr></thead>
 <tbody id="tbody"></tbody>
 </table>
 </div>
@@ -500,6 +513,8 @@ function renderTable(funds) {
     tb.innerHTML = '';
     funds.forEach((f,i) => {
         const sc = f.score>=70?'color:#00d68f':f.score>=50?'color:#4f8cff':f.score>=30?'color:#ffa502':'color:#ff4757';
+        const r6m = f.r6m !== null ? (f.r6m>0?'+':'')+f.r6m+'%' : '—';
+        const r6c = f.r6m !== null ? (f.r6m>0?'var(--grn)':'var(--red)') : 'var(--txt2)';
         tb.innerHTML += `<tr onclick="location.href='/fund/${f.code}?rate={{ rate }}&date={{ date }}'">
             <td>${i+1}</td>
             <td><strong style="color:var(--accl)">${f.code}</strong></td>
@@ -507,6 +522,7 @@ function renderTable(funds) {
             <td>${f.price.toFixed(4)}</td>
             <td style="color:${f.r1m>0?'var(--grn)':'var(--red)'};font-weight:600">${f.r1m>0?'+':''}${f.r1m}%</td>
             <td style="color:${f.r3m>0?'var(--grn)':'var(--red)'};font-weight:600">${f.r3m>0?'+':''}${f.r3m}%</td>
+            <td style="color:${r6c};font-weight:600">${r6m}</td>
             <td style="${sc};font-weight:700">${f.score}</td>
             <td>${f.pred}</td>
             <td>${f.risk_label}</td>
@@ -534,9 +550,9 @@ DETAIL_PAGE = HTML_TEMPLATE.replace(r"{% block content %}{% endblock %}", r"""
 
 <div class="det-grid">
 <div class="det-item"><div class="dl">Güncel Fiyat ({{ d.cur_date }})</div><div class="dv">{{ d.cur_price }}</div></div>
-<div class="det-item"><div class="dl">1 Aylık Getiri (%)</div><div class="dv" style="color:{{ '#00d68f' if d.ret_1m>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ret_1m) }}%</div></div>
-<div class="det-item"><div class="dl">3 Aylık Getiri (%)</div><div class="dv" style="color:{{ '#00d68f' if d.ret_3m>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ret_3m) }}%</div></div>
-<div class="det-item"><div class="dl">Yıllıklaştırılmış (%)</div><div class="dv" style="color:{{ '#00d68f' if d.ann_ret>0 else '#ff4757' }}">{{ "%+.1f"|format(d.ann_ret) }}%</div></div>
+<div class="det-item"><div class="dl">Son 1 Ay (%)</div><div class="dv" style="color:{{ '#00d68f' if d.ret_1m>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ret_1m) }}%</div></div>
+<div class="det-item"><div class="dl">Son 3 Ay (%)</div><div class="dv" style="color:{{ '#00d68f' if d.ret_3m>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ret_3m) }}%</div></div>
+<div class="det-item"><div class="dl">Son 6 Ay (%)</div><div class="dv" style="color:{{ '#00d68f' if d.ret_6m>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ret_6m) }}%</div></div>
 <div class="det-item"><div class="dl">Volatilite (Yıllık)</div><div class="dv">{{ d.vol }}%</div></div>
 <div class="det-item"><div class="dl">Max Drawdown</div><div class="dv" style="color:#ff4757">-{{ d.maxdd }}%</div></div>
 <div class="det-item"><div class="dl">Sharpe Oranı</div><div class="dv" style="color:{{ '#00d68f' if d.sharpe>1 else ('#4f8cff' if d.sharpe>0 else '#ff4757') }}">{{ d.sharpe }}</div></div>
@@ -641,29 +657,34 @@ def analyze():
         if not today_list:
             return render_template_string(HTML_TEMPLATE.replace(
                 r"{% block content %}{% endblock %}",
-                r'{% block content %}<div class="inp-sec"><h2 style="color:var(--red)">TEFAS\'tan veri alınamadı. Lütfen daha sonra tekrar deneyin.</h2><a href="/" class="btn" style="display:inline-block;margin-top:20px;text-decoration:none">← Geri Dön</a></div>{% endblock %}'
+                '{% block content %}<div class="inp-sec"><h2 style="color:var(--red)">TEFAS\'tan veri alınamadı. Lütfen daha sonra tekrar deneyin.</h2><a href="/" class="btn" style="display:inline-block;margin-top:20px;text-decoration:none">← Geri Dön</a></div>{% endblock %}'
             ))
 
         actual_date_fmt = today_list[0].get("tarih", actual_date)
         logger.info(f"Bugün: {actual_date_fmt}, {len(today_list)} fon")
 
-        # 1 ay önce (takvim ayı - TEFAS ile aynı)
-        logger.info("1 ay önce çekiliyor...")
         actual_dt = datetime.strptime(actual_date_fmt, "%Y-%m-%d")
-        m1_date = subtract_months(actual_dt, 1)
-        m1_base = m1_date.strftime("%Y%m%d")
-        _, m1_list = find_nearest_day(m1_base, offset_range=range(0, 5))
-        logger.info(f"1a: {len(m1_list)} fon (hedef: {m1_base})")
 
-        # 3 ay önce (takvim ayı - TEFAS ile aynı)
+        # 1 ay önce
+        logger.info("1 ay önce çekiliyor...")
+        m1_date = subtract_months(actual_dt, 1)
+        _, m1_list = find_nearest_day(m1_date.strftime("%Y%m%d"), offset_range=range(0, 5))
+        logger.info(f"1a: {len(m1_list)} fon")
+
+        # 3 ay önce
         logger.info("3 ay önce çekiliyor...")
         m3_date = subtract_months(actual_dt, 3)
-        m3_base = m3_date.strftime("%Y%m%d")
-        _, m3_list = find_nearest_day(m3_base, offset_range=range(0, 5))
-        logger.info(f"3a: {len(m3_list)} fon (hedef: {m3_base})")
+        _, m3_list = find_nearest_day(m3_date.strftime("%Y%m%d"), offset_range=range(0, 5))
+        logger.info(f"3a: {len(m3_list)} fon")
+
+        # 6 ay önce
+        logger.info("6 ay önce çekiliyor...")
+        m6_date = subtract_months(actual_dt, 6)
+        _, m6_list = find_nearest_day(m6_date.strftime("%Y%m%d"), offset_range=range(0, 7))
+        logger.info(f"6a: {len(m6_list)} fon")
 
         # Skorları hesapla
-        scores = calculate_scores(today_list, m1_list, m3_list, dep_net)
+        scores = calculate_scores(today_list, m1_list, m3_list, m6_list, dep_net)
 
         above_list = [s for s in scores if s["beats"]]
         recommended = [s for s in above_list if s["score"] >= 40][:6]
@@ -699,11 +720,10 @@ def analyze():
 
 @app.route("/results")
 def results_page():
-    """Sonuçlar sayfasına geri dön - rate parametresiyle"""
     rate = request.args.get("rate", 40)
     return render_template_string(HTML_TEMPLATE.replace(
         r"{% block content %}{% endblock %}",
-        f"""{{% block content %}}
+        """{% block content %}
         <div class="inp-sec">
             <h2>Yeniden analiz yapmak ister misiniz?</h2>
             <form action="/analyze" method="POST" class="inp-g" onsubmit="showLoad('TEFAS verileri çekiliyor...')">
@@ -713,7 +733,7 @@ def results_page():
                 <button type="submit" class="btn">🔍 Tekrar Analiz Et</button>
             </form>
         </div>
-        {{% endblock %}}"""
+        {% endblock %}""".format(rate=rate)
     ))
 
 
@@ -726,12 +746,12 @@ def fund_detail_page(code):
     if not detail:
         return render_template_string(HTML_TEMPLATE.replace(
             r"{% block content %}{% endblock %}",
-            f"""{{% block content %}}
+            """{% block content %}
             <div class="inp-sec">
-                <h2 style="color:var(--red)">{code.upper()} için yeterli veri bulunamadı</h2>
+                <h2 style="color:var(--red)">{code} için yeterli veri bulunamadı</h2>
                 <a href="/" class="btn" style="display:inline-block;margin-top:20px;text-decoration:none">← Geri Dön</a>
             </div>
-            {{% endblock %}}"""
+            {% endblock %}""".format(code=code.upper())
         ))
 
     import json as _json
