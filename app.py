@@ -125,9 +125,9 @@ def calculate_scores(today_list, m1_list, m3_list, m6_list, deposit_annual):
         # ── İşlem görmeyen fonları filtrele ──
         if price_now <= 0:
             continue
-        if inv_now < 10:       # 10'dan az yatırımcı = işlem görmüyor
+        if (row.get("tedPaySayisi") or 0) <= 0:   # Pay adedi yok = işlem görmüyor
             continue
-        if size < 1000:        # Çok küçük portföy = aktif değil
+        if inv_now < 200:     # 200'den az yatırımcı = dar kapsamlı/özel fon (ABG gibi)
             continue
 
         m1 = m1_map.get(code)
