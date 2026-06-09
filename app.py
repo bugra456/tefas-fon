@@ -221,49 +221,64 @@ def calculate_scores(today_list, m1_list, m3_list, m6_list, deposit_annual):
     return results
 
 
+def fetch_fund_price(fund_code, target_date_str):
+    """Belirli bir tarihte belirli bir fonun fiyatını çeker. Bulamazsa yakın günleri dener."""
+    fund_code = fund_code.upper()
+    for offset in range(0, 7):
+        d = datetime.strptime(target_date_str, "%Y%m%d") - timedelta(days=offset)
+        result = tefas_fetch_day(d.strftime("%Y%m%d"))
+        for r in result:
+            if r.get("fonKodu") == fund_code:
+                p = r.get("fiyat", 0)
+                if p and p > 0:
+                    return float(p), r.get("tarih", d.strftime("%Y-%m-%d"))
+    return None, None
+
+
 def analyze_detail(fund_code, deposit_rate, ref_date=None):
-    """Detay sayfası — TEFAS ile aynı metrikler: 1A, 3A, 6A."""
+    """Detay sayfası — getiri hesaplamaları ana sayfayla AYNI kaynakta."""
     if ref_date:
         ref_dt = datetime.strptime(ref_date, "%Y-%m-%d")
     else:
         ref_dt = datetime.now()
 
-    # 6 ay geçmiş = ~200 gün
-    history = tefas_fetch_fund_history(fund_code, days_back=200)
-    if len(history) < 5:
+    ref_str = ref_dt.strftime("%Y%m%d")
+
+    # ── Getiriler: Ana sayfayla AYNI yöntem — tam tarihleri çek ──
+    cur_price, cur_date = fetch_fund_price(fund_code, ref_str)
+    if not cur_price:
         return None
+
+    p_1m, _ = fetch_fund_price(fund_code, subtract_months(ref_dt, 1).strftime("%Y%m%d"))
+    p_3m, _ = fetch_fund_price(fund_code, subtract_months(ref_dt, 3).strftime("%Y%m%d"))
+    p_6m, _ = fetch_fund_price(fund_code, subtract_months(ref_dt, 6).strftime("%Y%m%d"))
+
+    ret_1m = (cur_price / p_1m) - 1 if p_1m and p_1m > 0 else None
+    ret_3m = (cur_price / p_3m) - 1 if p_3m and p_3m > 0 else None
+    ret_6m = (cur_price / p_6m) - 1 if p_6m and p_6m > 0 else None
+
+    # ── Grafik + teknik analiz: sadece son 45 gün yeterli ──
+    history = tefas_fetch_fund_history(fund_code, days_back=45)
+    if len(history) < 5:
+        # Geçmiş veri yoksa bile getiri bilgilerini göster
+        return {
+            "code": fund_code, "prices": [], "dates": [],
+            "cur_price": round(cur_price, 6), "cur_date": cur_date,
+            "ret_1m": round(ret_1m * 100, 2) if ret_1m is not None else None,
+            "ret_3m": round(ret_3m * 100, 2) if ret_3m is not None else None,
+            "ret_6m": round(ret_6m * 100, 2) if ret_6m is not None else None,
+            "vol": 0, "maxdd": 0, "sharpe": 0,
+            "tdir": "N/A", "ma_sig": "—", "ma10": 0, "ma20": 0,
+            "npoints": 0,
+        }
 
     history.sort(key=lambda h: h["date"])
     prices = [h["price"] for h in history]
     dates = [h["date"] for h in history]
 
-    def nearest_idx(target_str):
-        target = datetime.strptime(target_str, "%Y-%m-%d")
-        best_i, best_d = 0, 999
-        for i, d in enumerate(dates):
-            diff = abs((datetime.strptime(d, "%Y-%m-%d") - target).days)
-            if diff < best_d:
-                best_i, best_d = i, diff
-        return best_i
+    chart_prices = prices[-30:]
+    chart_dates = dates[-30:]
 
-    cur_idx = nearest_idx(ref_dt.strftime("%Y-%m-%d"))
-    cur_price = prices[cur_idx]
-    cur_date = dates[cur_idx]
-
-    # 1 Ay, 3 Ay, 6 Ay (takvim ayı — TEFAS ile aynı)
-    target_1m = subtract_months(ref_dt, 1)
-    target_3m = subtract_months(ref_dt, 3)
-    target_6m = subtract_months(ref_dt, 6)
-
-    p_1m = prices[nearest_idx(target_1m.strftime("%Y-%m-%d"))]
-    p_3m = prices[nearest_idx(target_3m.strftime("%Y-%m-%d"))]
-    p_6m = prices[nearest_idx(target_6m.strftime("%Y-%m-%d"))]
-
-    ret_1m = (cur_price / p_1m) - 1 if p_1m > 0 else 0
-    ret_3m = (cur_price / p_3m) - 1 if p_3m > 0 else 0
-    ret_6m = (cur_price / p_6m) - 1 if p_6m > 0 else 0
-
-    # Teknik analiz
     daily_ret = np.diff(prices) / prices[:-1]
     vol = float(np.std(daily_ret) * np.sqrt(252))
     cummax = np.maximum.accumulate(prices)
@@ -282,11 +297,11 @@ def analyze_detail(fund_code, deposit_rate, ref_date=None):
     ma_sig = "🟢 AL" if ma10 > ma20 else "🔴 SAT"
 
     return {
-        "code": fund_code, "prices": prices[-30:], "dates": dates[-30:],
+        "code": fund_code, "prices": chart_prices, "dates": chart_dates,
         "cur_price": round(cur_price, 6), "cur_date": cur_date,
-        "ret_1m": round(ret_1m * 100, 2),
-        "ret_3m": round(ret_3m * 100, 2),
-        "ret_6m": round(ret_6m * 100, 2),
+        "ret_1m": round(ret_1m * 100, 2) if ret_1m is not None else None,
+        "ret_3m": round(ret_3m * 100, 2) if ret_3m is not None else None,
+        "ret_6m": round(ret_6m * 100, 2) if ret_6m is not None else None,
         "vol": round(vol * 100, 2), "maxdd": round(maxdd * 100, 2),
         "sharpe": round(sharpe, 2), "tdir": tdir,
         "ma_sig": ma_sig, "ma10": round(ma10, 6), "ma20": round(ma20, 6),
@@ -550,9 +565,9 @@ DETAIL_PAGE = HTML_TEMPLATE.replace(r"{% block content %}{% endblock %}", r"""
 
 <div class="det-grid">
 <div class="det-item"><div class="dl">Güncel Fiyat ({{ d.cur_date }})</div><div class="dv">{{ d.cur_price }}</div></div>
-<div class="det-item"><div class="dl">Son 1 Ay (%)</div><div class="dv" style="color:{{ '#00d68f' if d.ret_1m>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ret_1m) }}%</div></div>
-<div class="det-item"><div class="dl">Son 3 Ay (%)</div><div class="dv" style="color:{{ '#00d68f' if d.ret_3m>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ret_3m) }}%</div></div>
-<div class="det-item"><div class="dl">Son 6 Ay (%)</div><div class="dv" style="color:{{ '#00d68f' if d.ret_6m>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ret_6m) }}%</div></div>
+<div class="det-item"><div class="dl">Son 1 Ay (%)</div><div class="dv" style="color:{{ '#00d68f' if d.ret_1m != None and d.ret_1m>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ret_1m) if d.ret_1m != None else "—" }}{{ "%" if d.ret_1m != None else "" }}</div></div>
+<div class="det-item"><div class="dl">Son 3 Ay (%)</div><div class="dv" style="color:{{ '#00d68f' if d.ret_3m != None and d.ret_3m>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ret_3m) if d.ret_3m != None else "—" }}{{ "%" if d.ret_3m != None else "" }}</div></div>
+<div class="det-item"><div class="dl">Son 6 Ay (%)</div><div class="dv" style="color:{{ '#00d68f' if d.ret_6m != None and d.ret_6m>0 else '#ff4757' }}">{{ "%+.2f"|format(d.ret_6m) if d.ret_6m != None else "—" }}{{ "%" if d.ret_6m != None else "" }}</div></div>
 <div class="det-item"><div class="dl">Volatilite (Yıllık)</div><div class="dv">{{ d.vol }}%</div></div>
 <div class="det-item"><div class="dl">Max Drawdown</div><div class="dv" style="color:#ff4757">-{{ d.maxdd }}%</div></div>
 <div class="det-item"><div class="dl">Sharpe Oranı</div><div class="dv" style="color:{{ '#00d68f' if d.sharpe>1 else ('#4f8cff' if d.sharpe>0 else '#ff4757') }}">{{ d.sharpe }}</div></div>
