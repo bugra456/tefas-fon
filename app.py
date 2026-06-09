@@ -1,11 +1,22 @@
 """
-TEFAS Fon Tavsiye Sistemi
-Hedef: Mevduat faizini güvenle geçebilecek fonları bulmak
+TEFAS Fon Tavsiye Sistemi v2
+Hedef: Mevduat faizini ANLAMLI şekilde geçebilecek fonları bulmak.
+
+Mantık: Eğer mevduat aylık %3 getiriyorsa, sana %3.02 getiren fonu tavsiye etmenin anlamı yok.
+Risk seviyesine göre minimum geçme farkı uygulanır:
+- Risk 1 (Para Piyasası): en az +0.50% fark
+- Risk 2 (Borçlanma): en az +0.70% fark
+- Risk 4 (Karma/Altın/Döviz): en az +1.00% fark
+- Risk 6 (Hisse): en az +2.00% fark
+- Risk 7 (Serbest): en az +3.00% fark
+
+Böylece her önerilen fon, riskine göre "geçmeye değecek" bir getiri sunar.
 """
 import logging
 from datetime import datetime, timedelta
 import calendar
 import time
+import json
 
 import numpy as np
 import requests
@@ -15,7 +26,9 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── TEFAS API ──────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# TEFAS API
+# ═══════════════════════════════════════════════════════════════
 
 def subtract_months(dt, months):
     month = dt.month - months
@@ -35,7 +48,7 @@ API_HEADERS = {
     "Content-Type": "application/json",
     "Origin": "https://www.tefas.gov.tr",
     "Referer": "https://www.tefas.gov.tr/tr/fon-verileri",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
 }
 
 
@@ -55,7 +68,8 @@ def tefas_fetch_day(target_date: str, kind: str = "YAT"):
         try:
             if attempt > 0:
                 time.sleep(2)
-            resp = requests.post(INFO_URL, json=api_body(target_date, target_date, kind), headers=API_HEADERS, timeout=30)
+            resp = requests.post(INFO_URL, json=api_body(target_date, target_date, kind),
+                                headers=API_HEADERS, timeout=30)
             data = resp.json()
             if data.get("errorCode") or data.get("errorMessage"):
                 return []
@@ -74,19 +88,17 @@ def find_nearest_day(base_date_str, offset_range=range(0, 7)):
     return None, []
 
 
-# ── RİSK SEVİYESİ (TEFAS ile aynı) ────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# RİSK SEVİYESİ (Fon adından TEFAS skalası)
+# ═══════════════════════════════════════════════════════════════
 
 def get_risk_level(fund_name):
-    """Fon adından TEFAS risk seviyesini hesaplar (1-7).
-    1 = En düşük risk (Para Piyasası)
-    7 = En yüksek risk (Serbest)
-    """
     n = fund_name.upper()
     if "PARA PİYASASI" in n or "PARA PIYASASI" in n:
         return 1
     if "BORÇLANMA" in n or "BORCLANMA" in n or "TAHVİL" in n or "TAHVIL" in n:
         return 2
-    if "KAMU" in n and ("BORÇ" in n or "TAHVİL" in n):
+    if "KAMU" in n and ("BORÇ" in n or "TAHVİL" in n or "TAHVIL" in n):
         return 2
     if "ALTIN" in n:
         return 4
@@ -104,7 +116,7 @@ def get_risk_level(fund_name):
         return 6
     if "SERBEST" in n:
         return 7
-    return 5  # Bilinmeyen = orta-yüksek
+    return 5
 
 
 RISK_LABELS = {
@@ -117,20 +129,44 @@ RISK_LABELS = {
     7: ("7/7 - Çok Yüksek", "#ff4757"),
 }
 
+RISK_NAMES = {
+    1: "Para Piyasası",
+    2: "Borçlanma / Tahvil",
+    3: "Orta Düşük Risk",
+    4: "Karma / Altın / Döviz",
+    5: "Emtia / Değişken",
+    6: "Hisse Senedi",
+    7: "Serbest",
+}
 
-# ── SKORLAMA: Mevduatı Geçme Analizi ──────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# MİNİMUM MEVDUAT FARKI (YAYILIM)
+# Bir fonun önerilebilmesi için mevduat üzerinde olması gereken
+# minimum aylık getiri farkı. Risk arttıkça gereken fark da artar.
+# ═══════════════════════════════════════════════════════════════
 
-def calculate_scores(today_list, m1_list, m3_list, m6_list, deposit_annual):
-    """
-    Her fon için: mevduatı geçme olasılığı + güvenilirlik puanı.
-    
-    Puan ne anlama gelir:
-    - Yüksek puan = Mevduatı geçme olasılığı yüksek VE riski düşük
-    - Düşük puan = Ya riski yüksek, ya da geçmişte mevduatı geçememiş
-    """
-    deposit_m = deposit_annual / 12  # Aylık net mevduat getirisi
+MIN_SPREAD = {
+    1: 0.005,   # +0.50% - Çok güvenli, az fark yeterli
+    2: 0.007,   # +0.70% - Güvenli, orta fark
+    3: 0.008,   # +0.80%
+    4: 0.010,   # +1.00% - Orta risk, anlamlı fark gerek
+    5: 0.015,   # +1.50% - Yüksek risk
+    6: 0.020,   # +2.00% - Hisse, çok yüksek fark gerek
+    7: 0.030,   # +3.00% - Serbest, ekstra yüksek fark gerek
+}
+
+# Skorlama için risk çarpanı (düşük risk = yüksek çarpan)
+RISK_MULT = {1: 1.0, 2: 0.9, 3: 0.8, 4: 0.65, 5: 0.5, 6: 0.35, 7: 0.2}
+
+
+# ═══════════════════════════════════════════════════════════════
+# SKORLAMA VE FİLTRELEME
+# ═══════════════════════════════════════════════════════════════
+
+def calculate_scores(today_list, m1_list, m3_list, m6_list, deposit_annual_pct):
+    deposit_monthly = (deposit_annual_pct / 100 * 0.85) / 12  # Aylık net (decimal)
+
     results = []
-
     m1_map = {r["fonKodu"]: r for r in m1_list}
     m3_map = {r["fonKodu"]: r for r in m3_list}
     m6_map = {r["fonKodu"]: r for r in m6_list}
@@ -142,7 +178,7 @@ def calculate_scores(today_list, m1_list, m3_list, m6_list, deposit_annual):
         size = row.get("portfoyBuyukluk", 0) or 0
         inv_now = row.get("kisiSayisi", 0) or 0
 
-        # Filtre: işlem görmeyen fonları ele
+        # Temel filtreler
         if price_now <= 0:
             continue
         if (row.get("tedPaySayisi") or 0) <= 0:
@@ -164,82 +200,109 @@ def calculate_scores(today_list, m1_list, m3_list, m6_list, deposit_annual):
         ret_3m = (price_now / price_m3) - 1
         ret_6m = (price_now / price_m6) - 1 if price_m6 and price_m6 > 0 else None
 
-        # TEFAS risk seviyesi
+        avg_1m = ret_1m
+        avg_3m = ret_3m / 3 if ret_3m else None
+        avg_6m = ret_6m / 6 if ret_6m else None
+
+        # ── BEKLENEN AYLIK GETİRİ ──
+        # Uzun dönem ortalamasına daha fazla ağırlık (daha güvenilir)
+        if avg_6m is not None:
+            expected = avg_6m * 0.50 + avg_3m * 0.30 + avg_1m * 0.20
+        elif avg_3m is not None:
+            expected = avg_3m * 0.60 + avg_1m * 0.40
+        else:
+            expected = avg_1m
+
+        # Risk seviyesi
         risk = get_risk_level(name)
         risk_label, risk_color = RISK_LABELS.get(risk, ("?/7", "#fff"))
 
-        # ── MEVDUATI GEÇME KONTROLÜ ──
-        beat_1m = ret_1m > deposit_m  # Son 1 ayda mevduatı geçti mi?
-        beat_3m_avg = (ret_3m / 3) > deposit_m  # Son 3 ay ortalamada geçti mi?
-        beat_6m_avg = (ret_6m / 6 > deposit_m) if ret_6m is not None else False
+        # ── MEVDUAT FARKI (en önemli metrik) ──
+        spread = expected - deposit_monthly
+        spread_pct = round(spread * 100, 2)
 
+        # ── MİNİMUM FARK KONTROLÜ ──
+        min_spread = MIN_SPREAD.get(risk, 0.01)
+        passes = spread >= min_spread
+
+        # ── MEVDUATI GEÇME SIKLIĞI ──
+        beat_1m = ret_1m > deposit_monthly
+        beat_3m_avg = (ret_3m / 3) > deposit_monthly if ret_3m else False
+        beat_6m_avg = (ret_6m / 6) > deposit_monthly if ret_6m else False
         beats_count = sum([beat_1m, beat_3m_avg, beat_6m_avg])
 
-        # ── PUAN HESABI ──
-        # 1) Mevduatı Geçme Sıklığı (35 puan) - 3 dönemden kaçında geçti?
+        # ── PUAN HESABI (100 puan) ──
+
+        # 1) Risk Ayarlı Getiri Prim Puanı (40 puan)
+        #    Mevduat farkı ne kadar büyük ve risk ne kadar düşükse puan o kadar yüksek
+        risk_mult = RISK_MULT.get(risk, 0.5)
+        s_spread = min(max(spread_pct, 0) * risk_mult * 15, 40)
+
+        # 2) Tutarlılık (25 puan) — Kaç dönemde mevduatı geçti?
         if beats_count == 3:
-            beat_score = 35
+            s_cons = 25
         elif beats_count == 2:
-            beat_score = 25
+            s_cons = 18
         elif beats_count == 1:
-            beat_score = 12
+            s_cons = 8
         else:
-            beat_score = 0
+            s_cons = 0
 
-        # 2) Risk Seviyesi (25 puan) - Düşük risk = öngörülebilir = güvenli
-        risk_score = max(0, 25 - (risk - 1) * 4)  # Risk 1→25, 7→1
-
-        # 3) Getiri İstikrarı (20 puan) - 1 aylık ile 3 aylık ort. arası fark küçük mü?
-        if ret_3m > 0:
-            avg_3m = ret_3m / 3
-            stability = 1 - min(abs(ret_1m - avg_3m) / max(abs(avg_3m), 0.001), 1)
-            stab_score = round(stability * 20)
+        # 3) Getiri İstikrarı (15 puan) — Aylık getiriler arası tutarlılık
+        if avg_6m is not None and avg_3m is not None:
+            returns = [avg_1m, avg_3m, avg_6m]
+            avg_ret = np.mean(returns)
+            if avg_ret > 0:
+                cv = np.std(returns) / avg_ret
+                stability = max(0, 1 - min(cv, 1))
+                s_stab = round(stability * 15)
+            else:
+                s_stab = 0
+        elif avg_3m is not None:
+            diff = abs(avg_1m - avg_3m) / max(abs(avg_3m), 0.001)
+            s_stab = round(max(0, 1 - min(diff, 1)) * 15)
         else:
-            stab_score = 0
+            s_stab = 3
 
-        # 4) Fon Büyüklüğü (10 puan) - Büyük fon = daha güvenli, daha likit
+        # 4) Fon Büyüklüğü (12 puan)
         if size > 5e9:
-            size_score = 10
+            s_size = 12
         elif size > 1e9:
-            size_score = 8
+            s_size = 10
+        elif size > 500e6:
+            s_size = 7
         elif size > 100e6:
-            size_score = 5
+            s_size = 4
         else:
-            size_score = 2
+            s_size = 2
 
-        # 5) Yatırımcı Güveni (10 puan) - Çok yatırımcı = güvenilir
+        # 5) Yatırımcı Sayısı (8 puan)
         if inv_now > 50000:
-            inv_score = 10
+            s_inv = 8
         elif inv_now > 10000:
-            inv_score = 7
+            s_inv = 6
         elif inv_now > 1000:
-            inv_score = 4
+            s_inv = 4
         else:
-            inv_score = 1
+            s_inv = 1
 
-        total = beat_score + risk_score + stab_score + size_score + inv_score
+        total = round(s_spread + s_cons + s_stab + s_size + s_inv, 1)
 
-        # Mevduatı geçme olasılığı tahmini
-        if beats_count == 3 and risk <= 2:
-            probability = "Çok Yüksek (%85+)"
-        elif beats_count >= 2 and risk <= 3:
-            probability = "Yüksek (%70-85)"
-        elif beats_count >= 2:
-            probability = "Orta (%50-70)"
-        elif beats_count == 1 and risk <= 3:
-            probability = "Orta (%50-65)"
-        elif beats_count == 1:
-            probability = "Düşük (%30-50)"
+        # ── GEÇME OLASILIĞI ──
+        if beats_count == 3 and spread_pct >= 1.5:
+            prob = "Çok Yüksek (%85+)"
+        elif beats_count == 3 and spread_pct >= 0.7:
+            prob = "Yüksek (%75-85)"
+        elif beats_count >= 2 and spread_pct >= 1.0:
+            prob = "Yüksek (%70-80)"
+        elif beats_count >= 2 and spread_pct >= 0.5:
+            prob = "Orta (%55-70)"
+        elif beats_count >= 1 and spread_pct >= 0.5:
+            prob = "Orta (%50-65)"
+        elif beats_count >= 1:
+            prob = "Düşük (%35-50)"
         else:
-            probability = "Çok Düşük (%15-30)"
-
-        # Beklenen aylık getiri tahmini (konservatif)
-        if ret_6m is not None:
-            expected_monthly = (ret_6m / 6) * 0.7  # %30 güvenlik indirimi
-        elif ret_3m > 0:
-            expected_monthly = (ret_3m / 3) * 0.6
-        else:
-            expected_monthly = ret_1m * 0.4
+            prob = "Çok Düşük (%20-35)"
 
         results.append({
             "code": code, "name": name, "price": price_now,
@@ -249,28 +312,36 @@ def calculate_scores(today_list, m1_list, m3_list, m6_list, deposit_annual):
             "r3m": round(ret_3m * 100, 2),
             "r6m": round(ret_6m * 100, 2) if ret_6m is not None else None,
             "beat_1m": beat_1m, "beat_3m": beat_3m_avg, "beat_6m": beat_6m_avg,
-            "beats": beat_1m,
-            "score": round(total, 1),
-            "s_beat": beat_score, "s_risk": risk_score,
-            "s_stab": stab_score, "s_size": size_score, "s_inv": inv_score,
-            "probability": probability,
-            "expected_monthly": round(expected_monthly * 100, 2),
-            "deposit_monthly": round(deposit_m * 100, 2),
+            "beats_count": beats_count,
+            "passes": passes,
+            "score": total,
+            "s_spread": round(s_spread, 1),
+            "s_cons": s_cons,
+            "s_stab": s_stab,
+            "s_size": s_size,
+            "s_inv": s_inv,
+            "probability": prob,
+            "expected_monthly": round(expected * 100, 2),
+            "deposit_monthly": round(deposit_monthly * 100, 2),
+            "spread_pct": spread_pct,
+            "min_required": round((deposit_monthly + min_spread) * 100, 2),
         })
 
     results.sort(key=lambda x: x["score"], reverse=True)
     return results
 
 
-# ── HTML TEMPLATE ──────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# HTML TEMPLATE
+# ═══════════════════════════════════════════════════════════════
 
-HTML_TEMPLATE = r"""
+HTML_BASE = r"""
 <!DOCTYPE html>
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TEFAS Fon Tavsiye Sistemi</title>
+<title>TEFAS Fon Tavsiye</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{--bg:#0a0e27;--bg2:#111638;--card:#161b40;--cardh:#1c224d;--acc:#4f8cff;
@@ -297,11 +368,24 @@ padding:12px 18px;color:var(--txt);font-size:1.3rem;width:180px;text-align:cente
 padding:14px 40px;border-radius:12px;font-size:1.1rem;font-weight:600;cursor:pointer;
 box-shadow:0 4px 15px rgba(79,140,255,.3);transition:all .3s}
 .btn:hover{transform:translateY(-2px);box-shadow:0 6px 25px rgba(79,140,255,.4)}
-.sum-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin:20px 0}
+.back-link{display:inline-block;color:var(--accl);text-decoration:none;margin-bottom:15px;
+font-size:1rem;padding:8px 16px;border-radius:8px;border:1px solid var(--brd);transition:.3s}
+.back-link:hover{background:var(--card);border-color:var(--acc)}
+.sum-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin:20px 0}
 .sum-card{background:var(--card);border:1px solid var(--brd);border-radius:12px;padding:20px;text-align:center}
 .sum-card .lb{font-size:.85rem;color:var(--txt2);margin-bottom:6px}
 .sum-card .vl{font-size:1.8rem;font-weight:700}
 .stitle{display:flex;align-items:center;gap:10px;margin:30px 0 15px;font-size:1.4rem;font-weight:700}
+.info-box{background:var(--bg);border:1px solid var(--brd);border-radius:12px;padding:20px;margin:20px 0}
+.info-box h3{color:var(--accl);margin-bottom:12px;font-size:1rem}
+.info-box p{color:var(--txt2);font-size:.85rem;line-height:1.6;margin-bottom:6px}
+.info-box strong{color:var(--txt)}
+.info-box table{width:100%;border-collapse:collapse;margin:10px 0}
+.info-box td{padding:5px 10px;font-size:.85rem;border-bottom:1px solid var(--brd)}
+.no-result{background:var(--card);border:1px solid var(--org);border-radius:14px;padding:30px;
+margin:20px 0;text-align:center}
+.no-result h3{color:var(--org);margin-bottom:12px;font-size:1.2rem}
+.no-result p{color:var(--txt2);line-height:1.6;margin-bottom:8px}
 .rec-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:16px;margin-bottom:30px}
 .fc{background:var(--card);border:1px solid var(--brd);border-radius:14px;padding:20px;
 cursor:pointer;transition:all .3s;position:relative;overflow:hidden;text-decoration:none;color:inherit;display:block}
@@ -314,192 +398,249 @@ justify-content:center;font-weight:700;font-size:.9rem}
 .fc .fcode{background:var(--bg);padding:4px 12px;border-radius:6px;font-weight:700;font-size:1rem;
 color:var(--accl);letter-spacing:1px}
 .fc .fname{font-size:.85rem;color:var(--txt2);line-height:1.3;flex:1}
-.mets{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.met{background:var(--bg);padding:8px 12px;border-radius:8px}
-.met .ml{font-size:.7rem;color:var(--txt2)}
-.met .mv{font-size:1rem;font-weight:600}
-.mv.pos{color:var(--grn)}.mv.neg{color:var(--red)}
 .risk-badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:.8rem;font-weight:700}
-.sbar{margin-top:12px;height:6px;background:var(--bg);border-radius:3px;overflow:hidden}
-.sbar-f{height:100%;border-radius:3px;transition:width .8s}
-.sbar-l{display:flex;justify-content:space-between;margin-top:4px;font-size:.75rem;color:var(--txt2)}
-.sbd{display:grid;grid-template-columns:repeat(5,1fr);gap:4px;margin-top:8px;text-align:center}
-.sbd .sl{font-size:.6rem;color:var(--txt2)}.sbd .sv{font-size:.7rem;font-weight:600}
+.spread-box{background:linear-gradient(135deg,rgba(0,214,143,.1),rgba(0,214,143,.05));
+border:1px solid rgba(0,214,143,.3);border-radius:10px;padding:12px;margin:10px 0;text-align:center}
+.spread-box.neg{background:linear-gradient(135deg,rgba(255,71,87,.1),rgba(255,71,87,.05));
+border-color:rgba(255,71,87,.3)}
+.spread-box .sv{font-size:1.8rem;font-weight:800;color:var(--grn)}
+.spread-box.neg .sv{color:var(--red)}
+.spread-box .sl{font-size:.75rem;color:var(--txt2);margin-top:2px}
+.cmp-row{display:flex;justify-content:space-between;padding:8px 12px;background:var(--bg);
+border-radius:8px;margin:8px 0;font-size:.9rem}
+.mets{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:8px}
+.met{background:var(--bg);padding:6px 10px;border-radius:6px;text-align:center}
+.met .ml{font-size:.65rem;color:var(--txt2)}
+.met .mv{font-size:.9rem;font-weight:600}
+.mv.pos{color:var(--grn)}.mv.neg{color:var(--red)}
+.beat-row{display:flex;gap:8px;margin:8px 0;font-size:.75rem}
+.beat-item{padding:3px 8px;border-radius:4px;font-weight:600}
+.beat-item.ok{background:rgba(0,214,143,.12);color:var(--grn)}
+.beat-item.no{background:rgba(255,71,87,.12);color:var(--red)}
 .prob{font-size:.85rem;padding:6px 12px;border-radius:8px;text-align:center;margin:8px 0;font-weight:600}
 .prob.high{background:rgba(0,214,143,.12);color:var(--grn)}
 .prob.mid{background:rgba(255,165,2,.12);color:var(--org)}
 .prob.low{background:rgba(255,71,87,.12);color:var(--red)}
+.sbar{margin-top:10px;height:6px;background:var(--bg);border-radius:3px;overflow:hidden}
+.sbar-f{height:100%;border-radius:3px;transition:width .8s}
+.sbar-l{display:flex;justify-content:space-between;margin-top:4px;font-size:.75rem;color:var(--txt2)}
 .tc{background:var(--card);border:1px solid var(--brd);border-radius:14px;overflow:hidden;margin:20px 0}
 .tabs{display:flex;border-bottom:1px solid var(--brd)}
-.tab{padding:12px 24px;cursor:pointer;color:var(--txt2);font-weight:500;border-bottom:2px solid transparent;transition:.3s}
+.tab{padding:12px 24px;cursor:pointer;color:var(--txt2);font-weight:500;
+border-bottom:2px solid transparent;transition:.3s;font-size:.9rem}
 .tab.act{color:var(--accl);border-bottom-color:var(--acc);background:rgba(79,140,255,.05)}
 .tab:hover{color:var(--txt)}
 table{width:100%;border-collapse:collapse}
-table th{background:var(--bg2);padding:12px 16px;text-align:left;font-size:.8rem;
-color:var(--txt2);text-transform:uppercase;letter-spacing:.5px}
-table td{padding:12px 16px;border-bottom:1px solid var(--brd);font-size:.9rem}
+table th{background:var(--bg2);padding:10px 14px;text-align:left;font-size:.75rem;
+color:var(--txt2);text-transform:uppercase;letter-spacing:.5px;white-space:nowrap}
+table td{padding:10px 14px;border-bottom:1px solid var(--brd);font-size:.85rem;white-space:nowrap}
 table tbody tr:hover{background:var(--cardh);cursor:pointer}
 .disc{background:rgba(255,165,2,.08);border:1px solid rgba(255,165,2,.2);border-radius:10px;
-padding:15px;margin:20px 0;font-size:.8rem;color:var(--org);text-align:center}
+padding:15px;margin:20px 0;font-size:.8rem;color:var(--org);text-align:center;line-height:1.6}
 .loading{display:none;position:fixed;inset:0;background:rgba(10,14,39,.9);z-index:200;
 justify-content:center;align-items:center;flex-direction:column;gap:20px}
 .loading.act{display:flex}
 .spin{width:50px;height:50px;border:4px solid var(--brd);border-top-color:var(--acc);
 border-radius:50%;animation:sp 1s linear infinite}
 @keyframes sp{to{transform:rotate(360deg)}}
-.info-box{background:var(--bg);border:1px solid var(--brd);border-radius:12px;padding:20px;margin:20px 0}
-.info-box h3{color:var(--accl);margin-bottom:12px;font-size:1rem}
-.info-box p{color:var(--txt2);font-size:.85rem;line-height:1.6;margin-bottom:8px}
-.info-box strong{color:var(--txt)}
 @media(max-width:768px){.ctn{padding:10px}.hdr h1{font-size:1.5rem}
 .rec-grid{grid-template-columns:1fr}.inp-g{flex-direction:column}
-.inp-g input{width:100%}.btn{width:100%}table{font-size:.8rem}
-table th,table td{padding:8px}}
+.inp-g input{width:100%}.btn{width:100%}table{font-size:.75rem}
+table th,table td{padding:6px 8px}}
 </style>
 </head>
 <body>
 <div class="ctn">
 <div class="hdr">
-<h1>📊 TEFAS Fon Tavsiye Sistemi</h1>
-<p>Mevduat faizinin üzerinde getiri potansiyeli olan yatırım fonlarını keşfedin</p>
+<h1>📊 TEFAS Fon Tavsiye</h1>
+<p>Mevduat faizini anlamlı şekilde geçebilecek fonları bulun</p>
 </div>
-
 {% block content %}{% endblock %}
 </div>
-
 <div class="loading" id="loading">
 <div class="spin"></div>
 <div style="color:var(--txt2)" id="loadTxt">Yükleniyor...</div>
 </div>
-
 <script>
 function $(s){return document.querySelector(s)}
 function showLoad(t){$('#loadTxt').textContent=t;$('#loading').classList.add('act')}
-function hideLoad(){$('#loading').classList.remove('act')}
 </script>
 </body>
 </html>
 """
 
-# ── PAGES ──────────────────────────────────────────────────────────────────────
+# ── ANA SAYFA ──
 
-HOME_PAGE = HTML_TEMPLATE.replace(r"{% block content %}{% endblock %}", r"""
+HOME_PAGE = HTML_BASE.replace(r"{% block content %}{% endblock %}", r"""
 {% block content %}
 <div class="inp-sec">
-<h2>🏦 Banka Mevduat Faiz Oranınızı Girin</h2>
-<form action="/analyze" method="POST" class="inp-g" onsubmit="showLoad('TEFAS verileri çekiliyor... 15-20 saniye sürebilir')">
-<label>Yıllık Brüt Mevduat Faizi:</label>
+<h2>🏦 Yıllık Brüt Mevduat Faiz Oranınız</h2>
+<form action="/analyze" method="POST" class="inp-g"
+      onsubmit="showLoad('TEFAS verileri çekiliyor... 15-20 saniye sürebilir')">
+<label>Yıllık Brüt Faiz:</label>
 <input type="number" name="rate" value="40" min="1" max="200" step="0.5" required>
 <label>%</label>
 <button type="submit" class="btn">🔍 Fonları Analiz Et</button>
 </form>
 <p style="color:var(--txt2);font-size:.8rem;margin-top:12px">
-Stopaj (%15) otomatik olarak düşülerek net mevduat getirisi hesaplanacaktır.
+Stopaj (%15) otomatik düşülür → Net aylık mevduat getirisi hesaplanır.<br>
+<strong>Örnek:</strong> %40 brüt → %34 net yıllık → <strong>aylık %2.83 net</strong> mevduat getirisi.
+<br><br>
+💡 <strong>Nasıl çalışır?</strong> Mevduatınızı sadece %0.01 geçen fonları değil,
+risk seviyesine göre anlamlı fark koyan fonları gösterir.
+Para piyasası fonları (Risk 1) için en az +0.50%,
+karma/altın fonları (Risk 4) için en az +1.00%,
+hisse fonları (Risk 6) için en az +2.00% fark gerekir.
 </p>
 </div>
 {% endblock %}
 """)
 
-RESULTS_PAGE = HTML_TEMPLATE.replace(r"{% block content %}{% endblock %}", r"""
+# ── SONUÇ SAYFASI ──
+
+RESULTS_PAGE = HTML_BASE.replace(r"{% block content %}{% endblock %}", r"""
 {% block content %}
 <a href="/" class="back-link">← Yeni Analiz</a>
 
 <div class="sum-row">
 <div class="sum-card"><div class="lb">Analiz Tarihi</div><div class="vl" style="font-size:1.2rem;color:var(--acc)">{{ date }}</div></div>
-<div class="sum-card"><div class="lb">Mevduat Aylık Net (%)</div><div class="vl" style="color:var(--org)">{{ dep_net }}%</div></div>
+<div class="sum-card"><div class="lb">Mevduat Aylık Net</div><div class="vl" style="color:var(--org)">{{ dep_m }}%</div></div>
 <div class="sum-card"><div class="lb">İşlem Gören Fon</div><div class="vl" style="color:var(--acc)">{{ total }}</div></div>
-<div class="sum-card"><div class="lb">Mevduat Üstü Fon</div><div class="vl" style="color:var(--grn)">{{ above }}</div></div>
+<div class="sum-card"><div class="lb">Mevduatı Geçen</div><div class="vl" style="color:var(--grn)">{{ above_count }}</div></div>
+<div class="sum-card"><div class="lb">Önerilen Fon</div><div class="vl" style="color:var(--grn)">{{ rec_count }}</div></div>
 </div>
 
 <div class="info-box">
-<h3>📌 Bu Puan Ne Demek?</h3>
-<p><strong>Puan (0-100):</strong> Fonun gelecek ay mevduatı geçme olasılığını ve güvenilirliğini gösterir. Yüksek puan = hem mevduatı geçme ihtimali yüksek hem de riski düşük/öngörülebilir.</p>
-<p><strong>Risk (1-7):</strong> TEFAS'ın kendi risk skalası. 1 = Para Piyasası (neredeyse mevduat kadar güvenli), 7 = Serbest fon (yüksek risk, yüksek dalgalanma).</p>
-<p><strong>Geçme Olasılığı:</strong> Son 1, 3 ve 6 aylık dönemlerde kaçında mevduatı geçtiğine ve risk seviyesine göre tahmin edilir.</p>
-<p><strong>Beklenen Aylık:</strong> Geçmiş getirilerin %30-40 güvenlik indirimiyle hesaplanmış konservatif tahmin. <u>Garanti değildir.</u></p>
+<h3>📌 Öneri Kriterleri — Risk seviyesine göre minimum fark</h3>
+<p>Mevduatınız aylık <strong>{{ dep_m }}%</strong> getiriyor. Bir fonun önerilebilmesi için
+beklenen aylık getirisi şu minimumları geçmelidir:</p>
+<table>
+<tr><td style="color:#00d68f">Risk 1 (Para Piyasası)</td><td>en az <strong>{{ min_r1 }}%</strong> (+0.50% fark)</td>
+    <td style="color:var(--txt2)">Neredeyse mevduat kadar güvenli</td></tr>
+<tr><td style="color:#4f8cff">Risk 2 (Borçlanma)</td><td>en az <strong>{{ min_r2 }}%</strong> (+0.70% fark)</td>
+    <td style="color:var(--txt2)">Düşük risk, tahvil ağırlıklı</td></tr>
+<tr><td style="color:#ffa502">Risk 4 (Karma/Altın/Döviz)</td><td>en az <strong>{{ min_r4 }}%</strong> (+1.00% fark)</td>
+    <td style="color:var(--txt2)">Orta risk, çeşitlendirilmiş</td></tr>
+<tr><td style="color:#ff4757">Risk 6 (Hisse)</td><td>en az <strong>{{ min_r6 }}%</strong> (+2.00% fark)</td>
+    <td style="color:var(--txt2)">Yüksek risk, hisse senedi ağırlıklı</td></tr>
+</table>
+<p style="margin-top:8px">Böylece sana %3.01 mevduata karşı %3.02 getiren bir fon <strong>önerilmez</strong>.
+Geçerli olmak için riskine göre anlamlı bir fark koymalıdır.</p>
 </div>
 
-<div class="stitle"><span style="font-size:1.6rem">⭐</span> Önerilen Fonlar</div>
+{% if recommended %}
+<div class="stitle"><span style="font-size:1.6rem">⭐</span> Önerilen Fonlar ({{ rec_count }})</div>
 <div class="rec-grid">
-        {% for f in recommended %}
-<div class="fc" onclick="location.href='https://www.tefas.gov.tr/tr/fon-ara?FonKod={{ f.code }}'">
+{% for f in recommended %}
+<div class="fc" onclick="window.open('https://www.tefas.gov.tr/tr/fon-ara?FonKod={{ f.code }}','_blank')">
 <div class="rank">{{ loop.index }}</div>
 <div class="fh">
 <span class="fcode">{{ f.code }}</span>
 <span class="fname">{{ f.name }}</span>
 </div>
-<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
 <span class="risk-badge" style="background:{{ f.risk_color }}22;color:{{ f.risk_color }}">{{ f.risk_label }}</span>
 </div>
-<div class="mets">
-<div class="met"><div class="ml">Fiyat</div><div class="mv">{{ "%.4f"|format(f.price) }}</div></div>
-<div class="met"><div class="ml">Son 1 Ay (%)</div><div class="mv {{ 'pos' if f.r1m > 0 else 'neg' }}">{{ "%+.2f"|format(f.r1m) }}%</div></div>
-<div class="met"><div class="ml">Son 3 Ay (%)</div><div class="mv {{ 'pos' if f.r3m > 0 else 'neg' }}">{{ "%+.2f"|format(f.r3m) }}%</div></div>
-<div class="met"><div class="ml">Son 6 Ay (%)</div><div class="mv {{ 'pos' if f.r6m != None and f.r6m > 0 else ('neg' if f.r6m != None else '') }}">{{ "%+.2f"|format(f.r6m) if f.r6m != None else "—" }}{{ "%" if f.r6m != None else "" }}</div></div>
-<div class="met"><div class="ml">Beklenen Aylık</div><div class="mv pos">{{ "+%.2f"|format(f.expected_monthly) }}%</div></div>
-<div class="met"><div class="ml">Mevduat Aylık</div><div class="mv" style="color:var(--org)">{{ f.deposit_monthly }}%</div></div>
+
+<div class="spread-box">
+<div class="sv">+{{ f.spread_pct }}%</div>
+<div class="sl">MEVDUAT FARKI (aylık)</div>
 </div>
+
+<div class="cmp-row">
+<span>Beklenen: <strong style="color:var(--grn)">{{ f.expected_monthly }}%</strong></span>
+<span>Mevduat: <strong style="color:var(--org)">{{ f.deposit_monthly }}%</strong></span>
+</div>
+
+<div class="mets">
+<div class="met"><div class="ml">Son 1 Ay</div><div class="mv {{ 'pos' if f.r1m > 0 else 'neg' }}">{{ "%+.2f"|format(f.r1m) }}%</div></div>
+<div class="met"><div class="ml">Son 3 Ay</div><div class="mv {{ 'pos' if f.r3m > 0 else 'neg' }}">{{ "%+.2f"|format(f.r3m) }}%</div></div>
+<div class="met"><div class="ml">Son 6 Ay</div><div class="mv {{ 'pos' if f.r6m and f.r6m > 0 else ('neg' if f.r6m else '') }}">{{ "%+.2f"|format(f.r6m) if f.r6m is not none else "—" }}</div></div>
+</div>
+
+<div class="beat-row">
+<span class="beat-item {{ 'ok' if f.beat_1m else 'no' }}">{{ "✓" if f.beat_1m else "✗" }} 1A</span>
+<span class="beat-item {{ 'ok' if f.beat_3m else 'no' }}">{{ "✓" if f.beat_3m else "✗" }} 3A</span>
+<span class="beat-item {{ 'ok' if f.beat_6m else 'no' }}">{{ "✓" if f.beat_6m else "✗" }} 6A</span>
+<span style="color:var(--txt2);margin-left:auto">{{ f.beats_count }}/3 dönem geçti</span>
+</div>
+
 {% set prob_class = 'high' if 'Çok Yüksek' in f.probability or 'Yüksek' in f.probability else ('mid' if 'Orta' in f.probability else 'low') %}
-<div class="prob {{ prob_class }}">🎯 Geçme Olasılığı: {{ f.probability }}</div>
-{% set sc = "#00d68f" if f.score >= 70 else ("#4f8cff" if f.score >= 50 else ("#ffa502" if f.score >= 30 else "#ff4757")) %}
+<div class="prob {{ prob_class }}">🎯 Sonraki ay geçme olasılığı: {{ f.probability }}</div>
+
+{% set sc = "#00d68f" if f.score >= 65 else ("#4f8cff" if f.score >= 45 else ("#ffa502" if f.score >= 25 else "#ff4757")) %}
 <div class="sbar"><div class="sbar-f" style="width:{{ f.score }}%;background:{{ sc }}"></div></div>
 <div class="sbar-l"><span>Güvenilirlik Puanı</span><span style="color:{{ sc }};font-weight:700">{{ f.score }}/100</span></div>
-<div class="sbd">
-<div><div class="sl">Geçme Sıklığı</div><div class="sv">{{ f.s_beat }}/35</div></div>
-<div><div class="sl">Risk Skoru</div><div class="sv">{{ f.s_risk }}/25</div></div>
-<div><div class="sl">İstikrar</div><div class="sv">{{ f.s_stab }}/20</div></div>
-<div><div class="sl">Fon Büyüklüğü</div><div class="sv">{{ f.s_size }}/10</div></div>
-<div><div class="sl">Yatırımcı</div><div class="sv">{{ f.s_inv }}/10</div></div>
-</div>
 </div>
 {% endfor %}
 </div>
-
-{% if not recommended %}
-<p style="color:var(--txt2);padding:20px;text-align:center">Kriterlere uygun fon bulunamadı. Düşük faiz oranı deneyin.</p>
+{% else %}
+<div class="no-result">
+<h3>😕 Mevduatınızı anlamlı şekilde geçen fon bulunamadı</h3>
+<p>
+Mevduatınız aylık <strong>{{ dep_m }}%</strong> net getiriyor.
+Bu oran zaten yüksek — düşük riskli fonların bunu anlamlı şekilde geçmesi zor.
+</p>
+<p>
+💡 <strong>Ne yapabilirsiniz?</strong><br>
+• Mevduat faizinizden memnunsanız, kalabilirsiniz — zaten iyi bir oran.<br>
+• Daha yüksek getiri istiyorsanız, Risk 4-6 fonları değerlendirin ama <strong>kayıp riskini</strong> unutmayın.<br>
+• Aşağıda tüm fonları görebilir, hangi fon ne kadar getiri potansiyeline sahip inceleyebilirsiniz.
+</p>
+</div>
 {% endif %}
 
 <div class="disc">
-⚠️ <strong>Önemli Uyarı:</strong> Bu uygulama geçmiş verilere dayalı olasılık hesabı yapmaktadır. <u>Yatırım tavsiyesi değildir.</u><br>
-Geçmiş performans gelecekteki getirilerin garantisi değildir. Yüksek puanlı bir fon bile zarar edebilir.<br>
-Karar verirken fonun <strong>risk seviyesini (1-7)</strong> mutlaka dikkate alın.
+⚠️ <strong>Uyarı:</strong> Geçmiş performans geleceğin garantisi değildir.
+"Beklenen aylık" geçmiş ortalamalara dayalı gerçekçi bir tahmindir, kesin değildir.
+Yüksek getiri = yüksek risk. Fonun risk seviyesini (1-7) mutlaka dikkate alın.
+Bu uygulama yatırım tavsiyesi değildir.
 </div>
 
 <div class="stitle"><span style="font-size:1.6rem">📋</span> Tüm Fonlar</div>
 <div class="tc">
 <div class="tabs">
-<div class="tab act" onclick="showTab('above',this)">Mevduat Üstü ({{ above }})</div>
-<div class="tab" onclick="showTab('all',this)">Tüm Fonlar ({{ total }})</div>
+<div class="tab act" onclick="showTab('above',this)">Mevduatı Geçen ({{ above_count }})</div>
+<div class="tab" onclick="showTab('all',this)">Tümü ({{ total }})</div>
 </div>
 <div style="overflow-x:auto">
 <table>
-<thead><tr><th>#</th><th>Kod</th><th>Fon Adı</th><th>Risk</th><th>1A %</th><th>3A %</th><th>6A %</th><th>Beklenen</th><th>Geçme Ol.</th><th>Puan</th></tr></thead>
+<thead><tr>
+<th>#</th><th>Kod</th><th>Fon Adı</th><th>Risk</th>
+<th>1A %</th><th>3A %</th><th>6A %</th>
+<th>Beklenen</th><th>Mevduat</th><th>Fark</th>
+<th>Geçme</th><th>Puan</th>
+</tr></thead>
 <tbody id="tbody"></tbody>
 </table>
 </div>
 </div>
 
 <script>
-const allFunds = {{ all_json|safe }};
 const aboveFunds = {{ above_json|safe }};
-let curTab = 'above';
+const allFunds = {{ all_json|safe }};
 
 function renderTable(funds) {
     const tb = document.getElementById('tbody');
     tb.innerHTML = '';
-    funds.forEach((f,i) => {
-        const sc = f.score>=70?'color:#00d68f':f.score>=50?'color:#4f8cff':f.score>=30?'color:#ffa502':'color:#ff4757';
+    funds.forEach((f, i) => {
+        const sc = f.score>=65?'color:#00d68f':f.score>=45?'color:#4f8cff':f.score>=25?'color:#ffa502':'color:#ff4757';
+        const spread_c = f.spread_pct>0?'var(--grn)':'var(--red)';
+        const spread_s = f.spread_pct>0?'+':'';
         const r6m = f.r6m !== null ? (f.r6m>0?'+':'')+f.r6m+'%' : '—';
         const r6c = f.r6m !== null ? (f.r6m>0?'var(--grn)':'var(--red)') : 'var(--txt2)';
+        const star = f.passes ? '⭐' : '';
         tb.innerHTML += `<tr onclick="window.open('https://www.tefas.gov.tr/tr/fon-ara?FonKod=${f.code}','_blank')">
-            <td>${i+1}</td>
+            <td>${star}${i+1}</td>
             <td><strong style="color:var(--accl)">${f.code}</strong></td>
-            <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${f.name}</td>
+            <td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${f.name}</td>
             <td><span class="risk-badge" style="background:${f.risk_color}22;color:${f.risk_color}">${f.risk}/7</span></td>
             <td style="color:${f.r1m>0?'var(--grn)':'var(--red)'};font-weight:600">${f.r1m>0?'+':''}${f.r1m}%</td>
             <td style="color:${f.r3m>0?'var(--grn)':'var(--red)'};font-weight:600">${f.r3m>0?'+':''}${f.r3m}%</td>
             <td style="color:${r6c};font-weight:600">${r6m}</td>
-            <td style="color:var(--grn);font-weight:600">+${f.expected_monthly}%</td>
+            <td style="color:var(--grn);font-weight:600">${f.expected_monthly}%</td>
+            <td style="color:var(--org)">${f.deposit_monthly}%</td>
+            <td style="color:${spread_c};font-weight:700;font-size:.95rem">${spread_s}${f.spread_pct}%</td>
             <td style="font-size:.8rem">${f.probability}</td>
             <td style="${sc};font-weight:700">${f.score}</td>
         </tr>`;
@@ -507,18 +648,31 @@ function renderTable(funds) {
 }
 
 function showTab(tab, el) {
-    curTab = tab;
-    document.querySelectorAll('.tab').forEach(t=>t.classList.remove('act'));
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('act'));
     el.classList.add('act');
-    renderTable(tab==='above'?aboveFunds:allFunds);
+    renderTable(tab === 'above' ? aboveFunds : allFunds);
 }
 renderTable(aboveFunds);
 </script>
 {% endblock %}
 """)
 
+# ── HATA SAYFASI ──
 
-# ── ROUTES ─────────────────────────────────────────────────────────────────────
+ERROR_PAGE = HTML_BASE.replace(r"{% block content %}{% endblock %}", """
+{% block content %}
+<div class="inp-sec">
+<h2 style="color:var(--red)">TEFAS'tan veri alınamadı</h2>
+<p style="color:var(--txt2);margin:15px 0">TEFAS API şu an yanıt vermiyor. Lütfen birkaç dakika sonra tekrar deneyin.</p>
+<a href="/" class="btn" style="display:inline-block;text-decoration:none">← Geri Dön</a>
+</div>
+{% endblock %}
+""")
+
+
+# ═══════════════════════════════════════════════════════════════
+# ROUTES
+# ═══════════════════════════════════════════════════════════════
 
 @app.route("/")
 def home():
@@ -531,9 +685,7 @@ def analyze():
     if rate <= 0 or rate > 200:
         return "Geçersiz faiz oranı", 400
 
-    dep_decimal = rate / 100
-    dep_net = dep_decimal * 0.85
-    dep_monthly = dep_net / 12
+    dep_monthly = (rate / 100 * 0.85) / 12
 
     try:
         logger.info("Bugün çekiliyor...")
@@ -551,10 +703,7 @@ def analyze():
                     break
 
         if not today_list:
-            return render_template_string(HTML_TEMPLATE.replace(
-                r"{% block content %}{% endblock %}",
-                '{% block content %}<div class="inp-sec"><h2 style="color:var(--red)">TEFAS\'tan veri alınamadı. Lütfen daha sonra tekrar deneyin.</h2><a href="/" class="btn" style="display:inline-block;margin-top:20px;text-decoration:none">← Geri Dön</a></div>{% endblock %}'
-            ))
+            return render_template_string(ERROR_PAGE)
 
         actual_date_fmt = today_list[0].get("tarih", actual_date)
         logger.info(f"Bugün: {actual_date_fmt}, {len(today_list)} fon")
@@ -576,33 +725,31 @@ def analyze():
         _, m6_list = find_nearest_day(m6_date.strftime("%Y%m%d"), offset_range=range(0, 7))
         logger.info(f"6a: {len(m6_list)} fon")
 
-        scores = calculate_scores(today_list, m1_list, m3_list, m6_list, dep_net)
+        scores = calculate_scores(today_list, m1_list, m3_list, m6_list, rate)
 
-        above_list = [s for s in scores if s["beats"]]
-        recommended = [s for s in above_list if s["score"] >= 30][:15]
+        # Önerilen: MIN_SPREAD filtresini geçen fonlar
+        recommended = [s for s in scores if s["passes"]][:20]
 
-        import json as _json
+        # Mevduatı geçen: pozitif spread'li fonlar
+        above = [s for s in scores if s["spread_pct"] > 0]
 
-        def fmt_size(n):
-            if n >= 1e9: return f"{n/1e9:.1f} Mrd"
-            if n >= 1e6: return f"{n/1e6:.1f} M"
-            if n >= 1e3: return f"{n/1e3:.0f} B"
-            return str(int(n))
-
-        def fmt_num(n):
-            return f"{int(n):,}".replace(",", ".")
+        # MinimumRequired hesapla
+        dep_pct = round(dep_monthly * 100, 2)
 
         return render_template_string(RESULTS_PAGE,
             date=actual_date_fmt,
-            dep_net=round(dep_monthly * 100, 2),
+            dep_m=dep_pct,
             total=len(scores),
-            above=len(above_list),
+            above_count=len(above),
+            rec_count=len(recommended),
             rate=rate,
             recommended=recommended,
-            all_json=_json.dumps(scores[:50]),
-            above_json=_json.dumps(above_list[:25]),
-            fmt_size=fmt_size,
-            fmt_num=fmt_num,
+            above_json=json.dumps(above[:40]),
+            all_json=json.dumps(scores[:60]),
+            min_r1=round((dep_monthly + 0.005) * 100, 2),
+            min_r2=round((dep_monthly + 0.007) * 100, 2),
+            min_r4=round((dep_monthly + 0.010) * 100, 2),
+            min_r6=round((dep_monthly + 0.020) * 100, 2),
         )
 
     except Exception as e:
