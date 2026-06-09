@@ -101,16 +101,16 @@ def get_risk_level(fund_name):
     if "KAMU" in n and ("BORÇ" in n or "TAHVİL" in n or "TAHVIL" in n):
         return 2
     if "ALTIN" in n:
-        return 4
+        return 5
     if "GÜMÜŞ" in n or "GUMUS" in n:
-        return 4
+        return 5
     if "DÖVİZ" in n or "DOVIZ" in n or "DOLAR" in n or "EURO" in n:
         return 4
     if "KARMA" in n:
         return 4
-    if "EMTİA" in n or "EMTIA" in n:
-        return 5
     if "DEĞİŞKEN" in n or "DEGISKEN" in n:
+        return 4
+    if "EMTİA" in n or "EMTIA" in n:
         return 5
     if "HİSSE" in n or "HISSE" in n:
         return 6
@@ -133,11 +133,70 @@ RISK_NAMES = {
     1: "Para Piyasası",
     2: "Borçlanma / Tahvil",
     3: "Orta Düşük Risk",
-    4: "Karma / Altın / Döviz",
-    5: "Emtia / Değişken",
+    4: "Karma / Değişken",
+    5: "Emtia / Altın / Yabancı",
     6: "Hisse Senedi",
     7: "Serbest",
 }
+
+# ═══════════════════════════════════════════════════════════════
+# GERÇEK RİSK SEVİYESİ (API'den fonKategori bazlı)
+# ═══════════════════════════════════════════════════════════════
+
+DETAIL_URL = "https://www.tefas.gov.tr/api/funds/fonBilgiGetir"
+
+# fonKategori → TEFAS risk seviyesi (1-7)
+CATEGORY_RISK = {
+    "Para Piyasası Fonu": 1,
+    "Kısa Vadeli Borçlanma Araçları Fonu": 2,
+    "Kamu Borçlanma Araçları Fonu": 2,
+    "Özel Sektör Borçlanma Araçları Fonu": 3,
+    "Borçlanma Araçları Fonu": 3,
+    "Eurobond Fonu": 3,
+    "Değişken Fon": 4,
+    "Karma Fon": 4,
+    "Katılım Fonu": 4,       # Altına/special'e göre değişir, default 4
+    "Altın Fonu": 5,
+    "Kıymetli Madenler Fonu": 5,
+    "Yabancı Fon Sepeti Fonu": 5,
+    "Yabancı Hisse Senedi Fonu": 6,
+    "Hisse Senedi Fonu": 6,
+    "Hisse Senedi Yoğun Fon": 6,
+    "Serbest Fon": 7,
+    "Girişim Sermayesi Yatırım Fonları": 7,
+    "Gayrimenkul Yatırım Fonları": 6,
+}
+
+
+def fetch_real_risk(fund_codes):
+    """Önerilen fonlar için TEFAS API'den gerçek fonKategori çekip risk seviyesini bulur."""
+    risk_map = {}
+    for code in fund_codes:
+        try:
+            resp = requests.post(DETAIL_URL, json={"fonKodu": code, "dil": "TR"},
+                                headers=API_HEADERS, timeout=10)
+            data = resp.json()
+            if data.get("resultList"):
+                cat = data["resultList"][0].get("fonKategori", "")
+                # Katılım Fonları için alt-kategori kontrolü
+                if cat == "Katılım Fonu":
+                    name = data["resultList"][0].get("fonUnvan", "").upper()
+                    if "PARA PİYASASI" in name or "PARA PIYASASI" in name:
+                        risk_map[code] = 1
+                    elif "ALTIN" in name:
+                        risk_map[code] = 5
+                    elif "HİSSE" in name or "HISSE" in name:
+                        risk_map[code] = 6
+                    else:
+                        risk_map[code] = CATEGORY_RISK.get(cat, 4)
+                elif cat in CATEGORY_RISK:
+                    risk_map[code] = CATEGORY_RISK[cat]
+                else:
+                    risk_map[code] = None  # Bilinmeyen kategori
+            time.sleep(0.3)
+        except Exception:
+            pass
+    return risk_map
 
 # ═══════════════════════════════════════════════════════════════
 # MİNİMUM MEVDUAT FARKI (YAYILIM)
@@ -532,7 +591,7 @@ Geçerli olmak için riskine göre anlamlı bir fark koymalıdır.</p>
 <div class="stitle"><span style="font-size:1.6rem">⭐</span> Önerilen Fonlar ({{ rec_count }})</div>
 <div class="rec-grid">
 {% for f in recommended %}
-<div class="fc" onclick="window.open('https://www.tefas.gov.tr/tr/fon-ara?FonKod={{ f.code }}','_blank')">
+<div class="fc" onclick="window.open('https://www.tefas.gov.tr/tr/fon-detayli-analiz/{{ f.code }}','_blank')">
 <div class="rank">{{ loop.index }}</div>
 <div class="fh">
 <span class="fcode">{{ f.code }}</span>
@@ -630,7 +689,7 @@ function renderTable(funds) {
         const r6m = f.r6m !== null ? (f.r6m>0?'+':'')+f.r6m+'%' : '—';
         const r6c = f.r6m !== null ? (f.r6m>0?'var(--grn)':'var(--red)') : 'var(--txt2)';
         const star = f.passes ? '⭐' : '';
-        tb.innerHTML += `<tr onclick="window.open('https://www.tefas.gov.tr/tr/fon-ara?FonKod=${f.code}','_blank')">
+        tb.innerHTML += `<tr onclick="window.open('https://www.tefas.gov.tr/tr/fon-detayli-analiz/${f.code}','_blank')">
             <td>${star}${i+1}</td>
             <td><strong style="color:var(--accl)">${f.code}</strong></td>
             <td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${f.name}</td>
@@ -726,6 +785,41 @@ def analyze():
         logger.info(f"6a: {len(m6_list)} fon")
 
         scores = calculate_scores(today_list, m1_list, m3_list, m6_list, rate)
+
+        # ── GERÇEK RİSK SEVİYELERİNİ API'DEN ÇEK ──
+        # İlk 50 aday fon için TEFAS'tan gerçek fonKategori çek
+        top_candidates = scores[:50]
+        candidate_codes = [s["code"] for s in top_candidates]
+        logger.info(f"Gerçek risk çekiliyor: {len(candidate_codes)} fon...")
+        real_risk_map = fetch_real_risk(candidate_codes)
+        logger.info(f"Gerçek risk alındı: {len(real_risk_map)} fon")
+
+        # Risk seviyelerini güncelle ve yeniden skorla
+        updated_count = 0
+        for s in scores:
+            real_risk = real_risk_map.get(s["code"])
+            if real_risk is not None and real_risk != s["risk"]:
+                old_risk = s["risk"]
+                s["risk"] = real_risk
+                risk_label, risk_color = RISK_LABELS.get(real_risk, ("?/7", "#fff"))
+                s["risk_label"] = risk_label
+                s["risk_color"] = risk_color
+                # Min spread ve passes'i güncelle
+                min_spread = MIN_SPREAD.get(real_risk, 0.01)
+                s["min_required"] = round((s["deposit_monthly"] / 100 + min_spread) * 100, 2)
+                s["passes"] = s["spread_pct"] / 100 >= min_spread
+                # Skoru güncelle
+                risk_mult = RISK_MULT.get(real_risk, 0.5)
+                s["s_spread"] = round(min(max(s["spread_pct"], 0) * risk_mult * 15, 40), 1)
+                s_risk = max(0, 25 - (real_risk - 1) * 4)
+                s["score"] = round(s["s_spread"] + s["s_cons"] + s["s_stab"] + s["s_size"] + s["s_inv"], 1)
+                updated_count += 1
+                logger.info(f"  {s['code']}: Risk {old_risk} → {real_risk}")
+
+        logger.info(f"Risk güncellendi: {updated_count} fon değişti")
+
+        # Güncel skorlara göre yeniden sırala
+        scores.sort(key=lambda x: x["score"], reverse=True)
 
         # Önerilen: MIN_SPREAD filtresini geçen fonlar
         recommended = [s for s in scores if s["passes"]][:20]
